@@ -71,9 +71,9 @@ xpub path : m/44'/133'/0'
 
 ## Building
 
-### macOS (native)
+### macOS (universal binary — arm64 + x86_64)
 
-Requires Rust toolchain (`rustup`). If not installed:
+Requires Rust toolchain (`rustup`) and Xcode command line tools. If Rust is not installed:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -83,8 +83,10 @@ Then build:
 
 ```bash
 ./scripts/build-macos.sh
-# Binary: target/release/zcash-key-derive
+# Binary: dist/zcash-key-derive-macos-universal
 ```
+
+The output is a [universal binary](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary) that runs natively on both Apple Silicon (M1/M2/M3) and Intel Macs.
 
 ### Linux (via Docker)
 
