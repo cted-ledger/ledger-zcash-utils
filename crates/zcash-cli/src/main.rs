@@ -170,7 +170,7 @@ fn cmd_derive(args: DeriveArgs) {
             Format::Human => {
                 println!("ufvk      : {}", keys.ufvk);
                 println!("xpub      : {}", keys.xpub);
-                println!("xpub path : {}", keys.xpub_path);
+                println!("xpub path : (derived from account {})", args.account);
                 if let Some(s) = &keys.sapling {
                     print_pool_human("sapling", s);
                 }
@@ -189,7 +189,7 @@ fn cmd_derive(args: DeriveArgs) {
                 let json = serde_json::json!({
                     "ufvk": keys.ufvk,
                     "xpub": keys.xpub,
-                    "xpub_path": keys.xpub_path,
+                    "xpub_path": format!("(derived from account {})", args.account),
                     "sapling": keys.sapling.as_ref().map(pool_json),
                     "orchard": keys.orchard.as_ref().map(pool_json),
                 });
