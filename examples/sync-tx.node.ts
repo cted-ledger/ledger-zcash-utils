@@ -215,6 +215,7 @@ if (result.transactions.length === 0) {
     const allNotes: ShieldedNote[] = [...tx.saplingNotes, ...tx.orchardNotes];
     const received = allNotes.filter((n) => n.transferType === "incoming").reduce((s, n) => s + n.amount, 0);
     const sent     = allNotes.filter((n) => n.transferType === "outgoing").reduce((s, n) => s + n.amount, 0);
+    console.log(`  Fee         ${zatToZec(tx.fee)}`);
     console.log(`  Net value   +${zatToZec(received)}  −${zatToZec(sent)}`);
     console.log();
   }

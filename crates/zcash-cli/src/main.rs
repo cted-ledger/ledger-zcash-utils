@@ -475,6 +475,7 @@ async fn cmd_sync(args: SyncArgs) {
 
                         let tx_recv = s_recv + o_recv;
                         let tx_sent = s_sent + o_sent;
+                        println!("           Fee        {}", fmt_zec(tx.fee_zatoshis as u64));
                         println!("           Net        +{}  −{}", fmt_zec(tx_recv), fmt_zec(tx_sent));
                     }
 
@@ -527,6 +528,7 @@ async fn cmd_sync(args: SyncArgs) {
                             "block_height": tx.block_height,
                             "block_hash": tx.block_hash,
                             "block_time": tx.block_time,
+                            "fee_zatoshis": tx.fee_zatoshis,
                             "sapling_notes": pool_notes(&tx.sapling_notes),
                             "orchard_notes": pool_notes(&tx.orchard_notes),
                         })

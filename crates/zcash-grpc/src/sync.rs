@@ -53,6 +53,8 @@ pub struct ShieldedTransaction {
     pub block_hash: String,
     /// Block timestamp (Unix seconds).
     pub block_time: u32,
+    /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard).
+    pub fee_zatoshis: i64,
     /// Decrypted Sapling notes belonging to this account.
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
@@ -176,6 +178,7 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
                 block_height: block.height as u32,
                 block_hash: block_hash.clone(),
                 block_time: block.time,
+                fee_zatoshis: decrypted.fee_zatoshis,
                 sapling_notes: decrypted
                     .sapling_outputs
                     .into_iter()

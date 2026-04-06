@@ -100,6 +100,9 @@ pub struct DecryptedOutput {
 pub struct DecryptedTx {
     pub sapling_outputs: Vec<DecryptedOutput>,
     pub orchard_outputs: Vec<DecryptedOutput>,
+    /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard).
+    /// Always ≥ 0 for valid fully-shielded transactions.
+    pub fee_zatoshis: i64,
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -281,7 +284,14 @@ pub fn full_decrypt_tx(
         })
         .collect();
 
-    Ok(DecryptedTx { sapling_outputs, orchard_outputs })
+    // fee = valueBalanceSapling + valueBalanceOrchard
+    // Both ZatBalance values are positive when net value leaves the pool (fee + transparent out).
+    // For fully shielded transactions with no transparent I/O this equals the miner fee exactly.
+    let sapling_vb: i64 = tx.sapling_bundle().map(|b| i64::from(b.value_balance())).unwrap_or(0);
+    let orchard_vb: i64 = tx.orchard_bundle().map(|b| i64::from(b.value_balance())).unwrap_or(0);
+    let fee_zatoshis = (sapling_vb + orchard_vb).max(0);
+
+    Ok(DecryptedTx { sapling_outputs, orchard_outputs, fee_zatoshis })
 }
 
 // ─── compact type parsers ─────────────────────────────────────────────────────

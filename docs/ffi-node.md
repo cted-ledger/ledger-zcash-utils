@@ -48,7 +48,9 @@ const result = await syncShielded({
   endHeight: tip,
   network: 'testnet',
 })
-// result.transactions, result.blocksScanned, result.elapsedMs
+// result.transactions[i].txid, .blockHeight, .blockTime, .fee (zatoshis)
+// result.transactions[i].saplingNotes, .orchardNotes
+// result.blocksScanned, result.elapsedMs
 ```
 
 ## Adding a new exported function

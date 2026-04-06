@@ -75,14 +75,16 @@ result.saplingOutputs.forEach { println("${it.amount} zatoshis: ${it.memo}") }
 val syncResult = withContext(Dispatchers.IO) {
     syncShielded(SyncParams(
         grpcUrl = "https://testnet.zec.rocks:443",
-        ufvk = keys.ufvk,
+        viewingKey = keys.ufvk,
         startHeight = 280000u,
         endHeight = 290000u,
         network = "testnet"
     ))
 }
 syncResult.transactions.forEach { tx ->
-    tx.notes.forEach { println("${it.value} zats: ${it.memo}") }
+    println("fee: ${tx.fee} zat")
+    tx.saplingNotes.forEach { println("sapling: ${it.amount} zat  ${it.transferType}  memo=${it.memo}") }
+    tx.orchardNotes.forEach { println("orchard: ${it.amount} zat  ${it.transferType}  memo=${it.memo}") }
 }
 
 // Chain tip query (run on Dispatchers.IO)
@@ -128,14 +130,18 @@ result.saplingOutputs.forEach { print("\($0.amount) zats: \($0.memo)") }
 Task.detached {
     let syncResult = try syncShielded(params: SyncParams(
         grpcUrl: "https://testnet.zec.rocks:443",
-        ufvk: keys.ufvk,
+        viewingKey: keys.ufvk,
         startHeight: 280000,
         endHeight: 290000,
         network: "testnet"
     ))
     for tx in syncResult.transactions {
-        for note in tx.notes {
-            print("\(note.value) zats: \(note.memo ?? "")")
+        print("fee: \(tx.fee) zat")
+        for note in tx.saplingNotes {
+            print("sapling: \(note.amount) zat  \(note.transferType)  memo=\(note.memo)")
+        }
+        for note in tx.orchardNotes {
+            print("orchard: \(note.amount) zat  \(note.transferType)  memo=\(note.memo)")
         }
     }
 }

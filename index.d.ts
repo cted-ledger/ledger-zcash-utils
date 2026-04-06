@@ -69,6 +69,11 @@ export interface ShieldedTransaction {
   blockHash: string
   /** Block timestamp (Unix seconds). */
   blockTime: number
+  /**
+   * Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard).
+   * Always ≥ 0 for valid fully-shielded transactions.
+   */
+  fee: number
   /** Decrypted Sapling notes belonging to this account. */
   saplingNotes: Array<ShieldedNote>
   /** Decrypted Orchard notes belonging to this account. */

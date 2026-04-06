@@ -62,6 +62,7 @@ pub struct ShieldedTransaction {
     pub block_height: u32,
     pub block_hash: String,
     pub block_time: u32,
+    pub fee: i64,
     pub sapling_notes: Vec<ShieldedNote>,
     pub orchard_notes: Vec<ShieldedNote>,
 }
@@ -262,6 +263,7 @@ pub fn sync_shielded(params: SyncParams) -> Result<SyncResult, ZcashError> {
                 block_height: tx.block_height,
                 block_hash: tx.block_hash,
                 block_time: tx.block_time,
+                fee: tx.fee_zatoshis,
                 sapling_notes: tx
                     .sapling_notes
                     .into_iter()

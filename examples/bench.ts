@@ -49,6 +49,6 @@ if (result.transactions.length > 0) {
   for (const tx of result.transactions) {
     const notes = [...tx.saplingNotes, ...tx.orchardNotes];
     const total = notes.reduce((s, n) => s + n.amount, 0);
-    console.log(`  ${tx.txid}  height=${tx.blockHeight}  total=${total} zat`);
+    console.log(`  ${tx.txid}  height=${tx.blockHeight}  total=${total} zat  fee=${tx.fee} zat`);
   }
 }

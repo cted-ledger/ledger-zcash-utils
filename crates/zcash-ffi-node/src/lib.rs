@@ -81,6 +81,9 @@ pub struct ShieldedTransaction {
     pub block_hash: String,
     /// Block timestamp (Unix seconds).
     pub block_time: u32,
+    /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard).
+    /// Always ≥ 0 for valid fully-shielded transactions.
+    pub fee: f64,
     /// Decrypted Sapling notes belonging to this account.
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
@@ -172,6 +175,7 @@ pub async fn sync_shielded(params: SyncParams) -> napi::Result<SyncResult> {
                 block_height: tx.block_height,
                 block_hash: tx.block_hash,
                 block_time: tx.block_time,
+                fee: tx.fee_zatoshis as f64,
                 sapling_notes: tx
                     .sapling_notes
                     .into_iter()
