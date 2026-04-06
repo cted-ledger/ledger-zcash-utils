@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::time::Duration;
 use tonic::transport::Channel;
 use zcash_client_backend::proto::{
     compact_formats::{CompactOrchardAction as ProtoOrchardAction, CompactSaplingOutput as ProtoSaplingOutput},
@@ -12,6 +13,10 @@ use zcash_crypto::decrypt::{
 use zcash_crypto::network::parse_network;
 
 use crate::client::connect;
+
+/// Maximum time to wait for the next compact block from the gRPC stream.
+/// Protects against the server silently stalling mid-stream.
+const STREAM_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── public types ─────────────────────────────────────────────────────────────
 
@@ -114,9 +119,12 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
     let mut blocks_scanned = 0u32;
     let mut all_transactions: Vec<ShieldedTransaction> = Vec::new();
 
-    while let Some(block) = stream
-        .message()
+    while let Some(block) = tokio::time::timeout(STREAM_MESSAGE_TIMEOUT, stream.message())
         .await
+        .map_err(|_| anyhow!(
+            "stream timeout: no block received within {}s (server stalled or network issue)",
+            STREAM_MESSAGE_TIMEOUT.as_secs()
+        ))?
         .map_err(|e| anyhow!("stream error: {}", e))?
     {
         let block_hash = hex::encode(block.hash.iter().copied().rev().collect::<Vec<u8>>());
@@ -228,5 +236,87 @@ fn to_shielded_note(o: DecryptedOutput) -> ShieldedNote {
         amount: o.amount,
         transfer_type: o.transfer_type,
         memo: o.memo,
+    }
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// UFVK derived from the "abandon ×11 about" BIP-39 mnemonic on mainnet
+    /// (account 0). This is a well-known test vector; no spending key material
+    /// is involved.
+    const TEST_UFVK: &str = "uview1qggz6nejagvka9wtm9r7xf84kkwy4cc0cgchptr98w0cyz33cj4958q5ulkd32nz2u3s0sp9yhcw7tu2n3nlw9x6ulghyd2zgc857tnzme2zpr3vn24zhtm2rjduv9a5zxlmzz404n7l0k69gmu4tfn2g3vpcn03rhz63e3l92fn8gra37tyly7utvgveswl20vz23pu84rc2nyqess38wvlgr2xzyhgj232ne5qutpe6ql6ghzetdy7pfzcmdzd5gd5dnwk25fwv7nnzmnty7u5ax3nzzgr6pdc905ckpd0s9v2cvn7e03qm7r46e5ngax536ywz7zxjptymm90px0rhvmqtwvttuy6d7degly023lqvskclk6mezyt69dwu6c4tfzrjgq4uuh5xa9m5dclgatykgtrrw268qe5pldfkx73f2kd5yyy2tjpjql92pa6tsk2nh2h88q23nee9z379het4akl6haqmuwf9d0nl0susg4tnxyk";
+
+    fn test_params(grpc_url: &str) -> SyncParams {
+        SyncParams {
+            grpc_url: grpc_url.to_string(),
+            viewing_key: TEST_UFVK.to_string(),
+            start_height: 2_000_000,
+            end_height: 2_000_010,
+            network: Some("mainnet".to_string()),
+        }
+    }
+
+    /// `run_sync` must propagate a clear connection error when the port is
+    /// closed (ECONNREFUSED), not hang or panic.
+    #[tokio::test]
+    async fn run_sync_propagates_connect_error_on_refused_port() {
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let url = format!("https://127.0.0.1:{}", addr.port());
+
+        let err = run_sync(test_params(&url)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `run_sync` must not hang indefinitely when a server accepts the TCP
+    /// connection but never completes the TLS handshake (simulates a silent
+    /// network drop or a non-TLS proxy intercepting the connection).
+    ///
+    /// The connect timeout must abort the attempt and return a clear error.
+    #[tokio::test]
+    async fn run_sync_connect_timeout_fires_when_server_stalls() {
+        use crate::client::CONNECT_TIMEOUT;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept TCP connections but never send a TLS ServerHello.
+        tokio::spawn(async move {
+            loop {
+                if let Ok((_sock, _)) = listener.accept().await {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            }
+        });
+
+        tokio::time::pause();
+
+        let url = format!("https://127.0.0.1:{port}");
+        let sync_handle = tokio::spawn(run_sync(test_params(&url)));
+
+        // Let the task start and register its connect timer.
+        tokio::task::yield_now().await;
+        // Advance past CONNECT_TIMEOUT so the timer fires without real waiting.
+        tokio::time::advance(CONNECT_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let result = sync_handle.await.unwrap();
+        assert!(result.is_err(), "expected an error, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("gRPC connect failed") || msg.contains("timeout") || msg.contains("transport"),
+            "unexpected error: {msg}"
+        );
     }
 }
