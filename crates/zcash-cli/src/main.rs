@@ -170,7 +170,7 @@ fn cmd_derive(args: DeriveArgs) {
             Format::Human => {
                 println!("ufvk      : {}", keys.ufvk);
                 println!("xpub      : {}", keys.xpub);
-                println!("xpub path : (derived from account {})", args.account);
+                println!("xpub path : (derived from requested account)");
                 if let Some(s) = &keys.sapling {
                     print_pool_human("sapling", s);
                 }
