@@ -10,22 +10,33 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout applied to every unary RPC call (GetLatestBlock, GetTransaction, …).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Establish a TLS-secured gRPC channel to a lightwalletd / Zaino endpoint.
+/// Establish a gRPC channel to a lightwalletd / Zaino endpoint.
+///
+/// TLS is applied automatically for `https://` URLs. Plaintext is used for
+/// `http://` URLs, which is intended for local proxy/test servers only.
 ///
 /// # Errors
 ///
 /// Returns an error if the URL is invalid, the TLS handshake fails, or the
 /// connection cannot be established within [`CONNECT_TIMEOUT`].
 pub async fn connect(grpc_url: &str) -> Result<Channel> {
-    tonic::transport::Channel::from_shared(grpc_url.to_owned())
+    let endpoint = tonic::transport::Channel::from_shared(grpc_url.to_owned())
         .map_err(|e| anyhow!("invalid gRPC URL: {}", e))?
-        .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
-        .map_err(|e| anyhow!("TLS config failed: {}", e))?
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .connect()
-        .await
-        .map_err(|e| anyhow!("gRPC connect failed: {}", e))
+        .timeout(REQUEST_TIMEOUT);
+
+    let channel = if grpc_url.starts_with("https://") {
+        endpoint
+            .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|e| anyhow!("TLS config failed: {}", e))?
+            .connect()
+            .await
+    } else {
+        endpoint.connect().await
+    }
+    .map_err(|e| anyhow!("gRPC connect failed: {}", e))?;
+
+    Ok(channel)
 }
 
 /// Query the current chain tip height from a lightwalletd endpoint.
