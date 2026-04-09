@@ -84,7 +84,7 @@ struct DeriveArgs {
 
 #[derive(Parser, Debug)]
 struct TipArgs {
-    /// gRPC endpoint URL (e.g. `https://testnet.zec.rocks:443`)
+    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
     #[arg(long)]
     grpc_url: String,
 }

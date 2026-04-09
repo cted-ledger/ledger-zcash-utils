@@ -33,11 +33,11 @@ design decisions.
 ledger-zcash-cli derive --mnemonic "abandon abandon ... about" --format json
 
 # Query chain tip
-ledger-zcash-cli tip --grpc-url https://testnet.zec.rocks:443
+ledger-zcash-cli tip --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/
 
 # Scan a block range
 ledger-zcash-cli sync \
-    --grpc-url https://testnet.zec.rocks:443 \
+    --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/ \
     --viewing-key uviewtest1... \
     --start-height 280000 \
     --end-height 285000 \
