@@ -2,7 +2,7 @@
 
 ## Overview
 
-`zcash-grpc` implements a two-phase scan algorithm to efficiently find and
+`zcash-sync` implements a two-phase scan algorithm to efficiently find and
 decrypt shielded transactions in a block range without fetching every full
 transaction from the server.
 
@@ -73,7 +73,7 @@ let ivks = decrypt::prepare_ivks(&params.viewing_key)?;
 ## Entry point
 
 ```rust
-// In zcash-grpc
+// In zcash-sync
 pub async fn run_sync(params: SyncParams) -> anyhow::Result<SyncResult>;
 pub async fn chain_tip(grpc_url: String) -> anyhow::Result<u32>;
 ```

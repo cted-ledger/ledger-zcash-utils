@@ -1,8 +1,7 @@
 //! # zcash-crypto
 //!
 //! Pure Zcash cryptographic operations with no FFI and no network I/O.
-//! This crate is the shared foundation used by all FFI binding crates
-//! (`zcash-ffi-node`, `zcash-ffi-mobile`) and the CLI (`zcash-cli`).
+//! This crate is the shared foundation used by `zcash-ffi-node` and the CLI (`zcash-cli`).
 //!
 //! ## Modules
 //!

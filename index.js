@@ -310,8 +310,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { deriveKeys, syncShielded, getChainTip } = nativeBinding
+const { TransactionStream, startSync, getChainTip } = nativeBinding
 
-module.exports.deriveKeys = deriveKeys
-module.exports.syncShielded = syncShielded
+module.exports.TransactionStream = TransactionStream
+module.exports.startSync = startSync
 module.exports.getChainTip = getChainTip

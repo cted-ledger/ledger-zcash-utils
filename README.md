@@ -9,8 +9,6 @@ runtime targets.
 | Target | Script | Output |
 |--------|--------|--------|
 | Node.js / Electron | `./scripts/build-napi.sh` | `index.*.node` |
-| Android | `./scripts/build-android.sh` | `dist/android/` |
-| iOS | `./scripts/build-ios.sh` | `dist/ios/ZcashFFI.xcframework` |
 | macOS CLI (universal) | `./scripts/build-cli-macos.sh` | `dist/ledger-zcash-cli-macos-universal` |
 | Linux CLI (static) | `./scripts/build-cli-linux.sh` | `dist/ledger-zcash-cli-linux-x86_64` |
 
@@ -20,9 +18,8 @@ See [`docs/build-targets.md`](docs/build-targets.md) for prerequisites and detai
 
 ```
 zcash-crypto     Pure cryptographic logic (key derivation, trial/full decryption)
-zcash-grpc       Async gRPC sync engine (lightwalletd / Zaino)
+zcash-sync       Async sync engine (lightwalletd / Zaino)
 zcash-ffi-node   Node.js / Electron native addon (napi-rs)
-zcash-ffi-mobile Android + iOS bindings (UniFFI)
 zcash-cli        CLI binary (ledger-zcash-cli)
 ```
 
@@ -81,7 +78,6 @@ cargo check --workspace
 - [`docs/key-derivation.md`](docs/key-derivation.md) — BIP-39 → UFVK pipeline
 - [`docs/block-sync.md`](docs/block-sync.md) — gRPC trial + full decryption
 - [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
-- [`docs/ffi-mobile.md`](docs/ffi-mobile.md) — Android/iOS UniFFI integration
 - [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
 
 ## Release

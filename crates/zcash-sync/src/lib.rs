@@ -1,11 +1,10 @@
-//! # zcash-grpc
+//! # zcash-sync
 //!
-//! Async gRPC sync engine that connects to a lightwalletd/Zaino node,
+//! Async sync engine that connects to a lightwalletd/Zaino node,
 //! streams compact blocks, and decrypts transactions matching a given UFVK.
 //!
 //! This crate is the only crate in the workspace that depends on `tonic` and
-//! `tokio`. It is **not** a dependency of `zcash-ffi-mobile` — mobile targets
-//! manage their own network transport and call `zcash-crypto` directly.
+//! `tokio`.
 //!
 //! ## Modules
 //!

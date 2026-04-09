@@ -7,13 +7,17 @@ use zcash_client_backend::proto::service::{
 
 /// Timeout for establishing the TCP+TLS connection.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout applied to every unary RPC call (GetLatestBlock, GetTransaction, …).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout applied to unary RPC calls (GetLatestBlock, GetTransaction, …).
+/// Not applied to streaming RPCs (GetBlockRange) — those run until completion.
+pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Establish a gRPC channel to a lightwalletd / Zaino endpoint.
 ///
 /// TLS is applied automatically for `https://` URLs. Plaintext is used for
 /// `http://` URLs, which is intended for local proxy/test servers only.
+///
+/// No channel-level timeout is set — callers apply per-request timeouts via
+/// `tonic::Request::set_timeout` so that streaming RPCs are not interrupted.
 ///
 /// # Errors
 ///
@@ -22,8 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn connect(grpc_url: &str) -> Result<Channel> {
     let endpoint = tonic::transport::Channel::from_shared(grpc_url.to_owned())
         .map_err(|e| anyhow!("invalid gRPC URL: {}", e))?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT);
+        .connect_timeout(CONNECT_TIMEOUT);
 
     let channel = if grpc_url.starts_with("https://") {
         endpoint
@@ -47,8 +50,10 @@ pub async fn connect(grpc_url: &str) -> Result<Channel> {
 pub async fn chain_tip(grpc_url: String) -> Result<u32> {
     let channel = connect(&grpc_url).await?;
     let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
+    let mut req = tonic::Request::new(ChainSpec {});
+    req.set_timeout(UNARY_TIMEOUT);
     let latest = client
-        .get_latest_block(ChainSpec {})
+        .get_latest_block(req)
         .await
         .map_err(|e| anyhow!("GetLatestBlock failed: {}", e))?
         .into_inner();

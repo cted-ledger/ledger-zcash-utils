@@ -20,42 +20,40 @@ changing the Rust exports:
 pnpm napi typegen --cargo-cwd crates/zcash-ffi-node
 ```
 
-### Key derivation
-
-```typescript
-import { deriveKeys } from './index.js'
-
-const keys = deriveKeys({
-  mnemonic: 'abandon abandon ... about',
-  account: 0,
-  network: 'mainnet',      // optional, default 'mainnet'
-  includeSaplingInUfvk: true,  // optional, default true
-})
-// keys.ufvk, keys.xpub, keys.xpubPath, keys.sapling, keys.orchard
-```
+> **Note:** Key derivation (`derive_keys`) is available in the CLI (`zcash-cli
+> derive`) and in the `zcash-crypto` Rust crate, but is not exported by the
+> Node.js binding. Only `startSync`, `getChainTip`, and `TransactionStream` are
+> exposed.
 
 ### Block scanning
 
 ```typescript
-import { syncShielded, getChainTip } from './index.js'
+import { startSync, getChainTip, TransactionStream, ShieldedTransaction, SyncStats } from './index.js'
 
 const tip = await getChainTip('https://testnet.zec.rocks:443')
 
-const result = await syncShielded({
+const stream: TransactionStream = await startSync({
   grpcUrl: 'https://testnet.zec.rocks:443',
   viewingKey: 'uviewtest1...',
   startHeight: 280000,
   endHeight: tip,
   network: 'testnet',
 })
-// result.transactions[i].txid, .blockHeight, .blockTime, .fee (zatoshis)
-// result.transactions[i].saplingNotes, .orchardNotes
-// result.blocksScanned, result.elapsedMs
+
+let tx: ShieldedTransaction | null
+while ((tx = await stream.next()) !== null) {
+  // tx.txid, tx.blockHeight, tx.blockTime, tx.fee (zatoshis)
+  // tx.saplingNotes, tx.orchardNotes
+  console.log(tx)
+}
+
+const stats: SyncStats = await stream.stats()
+// stats.blocksScanned, stats.elapsedMs
 ```
 
 ## Adding a new exported function
 
-1. Implement logic in `zcash-crypto` (or `zcash-grpc` if it needs network I/O).
+1. Implement logic in `zcash-crypto` (or `zcash-sync` if it needs network I/O).
 2. In `crates/zcash-ffi-node/src/lib.rs`, add the NAPI wrapper:
 
 ```rust

@@ -128,11 +128,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish
+
       - name: Download all .node binaries
         uses: actions/download-artifact@v4
         with:
           pattern: napi-*
           merge-multiple: true
+
+      - name: Regenerate index.js and index.d.ts from Rust source
+        run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 
       - name: Download CLI binaries
         uses: actions/download-artifact@v4

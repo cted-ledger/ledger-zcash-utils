@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::BufRead;
+use std::sync::Arc;
 use zcash_crypto::keys::{derive_keys_with_options, DeriveOptions, PoolViewingKeys, ZcashNetwork};
 
 // ─── shared CLI enums ─────────────────────────────────────────────────────────
@@ -117,9 +119,28 @@ struct SyncArgs {
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
 
-    /// Number of blocks per gRPC call (default: 50 000)
+    /// Number of blocks per gRPC call (default: 5 000).
+    /// Smaller values reduce the risk of server-side timeouts at the cost of
+    /// more TLS connection overhead. Heavy mainnet blocks (height > 1,700,000)
+    /// can saturate CPU trial decryption; 5k keeps each chunk under ~40s.
     #[arg(long)]
     chunk_size: Option<u32>,
+
+    /// Maximum number of retry attempts per chunk on timeout errors (default: 3).
+    /// On each retry the failing range is split in half, so up to 2^max_retries
+    /// sub-requests may be issued for a single original chunk.
+    #[arg(long)]
+    max_retries: Option<u32>,
+
+    /// Skip Sapling trial decryption entirely — only Orchard actions are processed.
+    ///
+    /// When set, the default --start-height is adjusted to the Orchard activation
+    /// block (mainnet: 1 687 104, testnet: 1 842 420) since earlier blocks contain
+    /// no Orchard outputs and can be skipped completely.
+    ///
+    /// Use this flag when the wallet only supports Orchard (e.g. Ledger devices).
+    #[arg(long)]
+    orchard_only: bool,
 
     /// Print progress and match info to stderr
     #[arg(long)]
@@ -204,7 +225,7 @@ fn cmd_derive(args: DeriveArgs) {
 }
 
 async fn cmd_tip(args: TipArgs) {
-    match zcash_grpc::client::chain_tip(args.grpc_url).await {
+    match zcash_sync::client::chain_tip(args.grpc_url).await {
         Ok(height) => println!("{height}"),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -214,19 +235,26 @@ async fn cmd_tip(args: TipArgs) {
 }
 
 async fn cmd_sync(args: SyncArgs) {
-    use zcash_grpc::sync::{run_sync, SyncParams};
 
     let network_str = match args.network {
         Network::Mainnet => "mainnet".to_string(),
         Network::Testnet => "testnet".to_string(),
     };
 
-    let sapling_activation = match args.network {
-        Network::Mainnet => 419_200u32,
-        Network::Testnet => 280_000u32,
+    let default_start_height = if args.orchard_only {
+        // Skip pre-Orchard blocks entirely — no Orchard outputs before NU5.
+        match args.network {
+            Network::Mainnet => 1_687_104u32,
+            Network::Testnet => 1_842_420u32,
+        }
+    } else {
+        match args.network {
+            Network::Mainnet => 419_200u32,
+            Network::Testnet => 280_000u32,
+        }
     };
 
-    let start_height = args.start_height.unwrap_or(sapling_activation);
+    let start_height = args.start_height.unwrap_or(default_start_height);
 
     let end_height = match args.end_height {
         Some(h) => h,
@@ -234,7 +262,7 @@ async fn cmd_sync(args: SyncArgs) {
             if args.verbose {
                 eprintln!("[sync] --end-height not set, querying chain tip from {}...", args.grpc_url);
             }
-            match zcash_grpc::client::chain_tip(args.grpc_url.clone()).await {
+            match zcash_sync::client::chain_tip(args.grpc_url.clone()).await {
                 Ok(h) => {
                     if args.verbose {
                         eprintln!("[sync] chain tip = {h}");
@@ -249,7 +277,12 @@ async fn cmd_sync(args: SyncArgs) {
         }
     };
 
-    let chunk_size = args.chunk_size.unwrap_or(50_000);
+    let chunk_size = args.chunk_size.unwrap_or(10_000);
+    if chunk_size == 0 {
+        eprintln!("Error: --chunk-size must be greater than 0");
+        std::process::exit(1);
+    }
+    let max_retries = args.max_retries.unwrap_or(3);
     let total_blocks = end_height.saturating_sub(start_height) + 1;
     let n_chunks = (total_blocks + chunk_size - 1) / chunk_size;
     let verbose = args.verbose;
@@ -271,6 +304,9 @@ async fn cmd_sync(args: SyncArgs) {
         fmt_num(start_height), fmt_num(end_height), fmt_num(total_blocks));
     eprintln!("{:<w$}{} chunks × {} blocks",
         "Chunks", fmt_num(n_chunks), fmt_num(chunk_size));
+    eprintln!("{:<w$}{}",
+        "Mode",
+        if args.orchard_only { "orchard-only (Sapling skipped)" } else { "full (Sapling + Orchard)" });
     eprintln!("{sep}");
     eprintln!();
 
@@ -281,7 +317,8 @@ async fn cmd_sync(args: SyncArgs) {
         );
     }
 
-    // Progress bar (shown only when not in verbose mode)
+    // Progress bar (shown only when not in verbose mode).
+    // Wrapped in Arc so it can be shared with the on_block_done callback.
     let pb = if !verbose {
         let bar = ProgressBar::new(total_blocks as u64);
         bar.set_style(
@@ -303,56 +340,100 @@ async fn cmd_sync(args: SyncArgs) {
             }),
         );
         bar.enable_steady_tick(std::time::Duration::from_millis(100));
-        Some(bar)
+        Some(Arc::new(bar))
     } else {
         None
     };
 
+    // Callback invoked per block by the sync engine — drives real-time progress.
+    let on_block_done: Option<Arc<dyn Fn() + Send + Sync>> = pb.as_ref().map(|b| {
+        let b = Arc::clone(b);
+        Arc::new(move || { b.inc(1); }) as Arc<dyn Fn() + Send + Sync>
+    });
+
+    // Build the full list of chunks upfront so we can fan them out.
+    let chunks: Vec<(u32, u32)> = {
+        let mut v = Vec::with_capacity(n_chunks as usize);
+        let mut h = start_height;
+        while h <= end_height {
+            let chunk_end = (h + chunk_size - 1).min(end_height);
+            v.push((h, chunk_end));
+            h = chunk_end + 1;
+        }
+        v
+    };
+
     let global_start = std::time::Instant::now();
-    let mut all_transactions: Vec<zcash_grpc::sync::ShieldedTransaction> = Vec::new();
+
+    let chunk_results: Vec<_> = {
+        let grpc_url = args.grpc_url.clone();
+        let viewing_key = args.viewing_key.clone();
+        let network_str = network_str.clone();
+        let orchard_only = args.orchard_only;
+
+        futures::stream::iter(chunks.into_iter().enumerate())
+            .map(|(idx, (s, e))| {
+                let grpc_url = grpc_url.clone();
+                let viewing_key = viewing_key.clone();
+                let network_str = network_str.clone();
+                let on_block_done = on_block_done.as_ref().map(Arc::clone);
+                async move {
+                    let r = zcash_sync::sync::run_sync(zcash_sync::sync::SyncParams {
+                        grpc_url,
+                        viewing_key,
+                        start_height: s,
+                        end_height: e,
+                        network: Some(network_str),
+                        verbose,
+                        max_retries: Some(max_retries),
+                        orchard_only,
+                        on_block_done,
+                        on_transaction: None,
+                    })
+                    .await;
+                    (idx, s, e, r)
+                }
+            })
+            .buffer_unordered(1)
+            .collect()
+            .await
+    };
+
+    let mut all_transactions: Vec<zcash_sync::sync::ShieldedTransaction> = Vec::new();
     let mut total_blocks_scanned = 0u32;
     let mut total_tx_found = 0usize;
 
-    let mut h = start_height;
-    let mut chunk_idx = 0u32;
-    while h <= end_height {
-        let chunk_end = (h + chunk_size - 1).min(end_height);
-        let chunk_t0 = std::time::Instant::now();
+    // Sort results back into chunk order before merging (buffer_unordered is unordered).
+    let mut sorted_results = chunk_results;
+    sorted_results.sort_unstable_by_key(|(idx, _, _, _)| *idx);
 
-        if verbose {
-            let pct = (h - start_height) * 100 / total_blocks;
-            eprintln!(
-                "[sync] chunk {}/{}: {}..{} ({}% done, {}s elapsed)",
-                chunk_idx + 1, n_chunks, h, chunk_end, pct,
-                global_start.elapsed().as_secs()
-            );
-        }
-
-        let chunk_result = match run_sync(SyncParams {
-            grpc_url: args.grpc_url.clone(),
-            viewing_key: args.viewing_key.clone(),
-            start_height: h,
-            end_height: chunk_end,
-            network: Some(network_str.clone()),
-        }).await {
+    for (idx, s, e, result) in sorted_results {
+        let chunk_result = match result {
             Ok(r) => r,
-            Err(e) => {
+            Err(err) => {
                 if let Some(ref bar) = pb { bar.abandon(); }
-                eprintln!("Error on chunk {}..{}: {e}", h, chunk_end);
+                eprintln!("Error on chunk {}..{}: {err}", s, e);
                 std::process::exit(1);
             }
         };
 
         if verbose {
-            let blps = chunk_result.blocks_scanned as f64 / chunk_t0.elapsed().as_secs_f64();
+            let blps = chunk_result.blocks_scanned as f64
+                / (chunk_result.elapsed_ms as f64 / 1000.0).max(0.001);
             let tx_tag = if chunk_result.transactions.is_empty() { String::new() }
                          else { format!("  *** {} tx found ***", chunk_result.transactions.len()) };
             eprintln!(
                 "[sync] chunk {}/{} done: {} blocks in {}ms ({:.0} bl/s){}",
-                chunk_idx + 1, n_chunks,
+                idx + 1, n_chunks,
                 chunk_result.blocks_scanned,
-                chunk_t0.elapsed().as_millis(),
-                blps, tx_tag
+                chunk_result.elapsed_ms,
+                blps, tx_tag,
+            );
+            eprintln!(
+                "[sync]   trial_decrypt={}ms  get_transaction={}ms  full_decrypt={}ms",
+                chunk_result.trial_decrypt_ms,
+                chunk_result.get_transaction_ms,
+                chunk_result.full_decrypt_ms,
             );
         }
 
@@ -361,17 +442,13 @@ async fn cmd_sync(args: SyncArgs) {
         all_transactions.extend(chunk_result.transactions);
 
         if let Some(ref bar) = pb {
-            bar.inc(chunk_result.blocks_scanned as u64);
             if total_tx_found > 0 {
                 bar.set_message(format!("{total_tx_found} tx found"));
             }
         }
-
-        h = chunk_end + 1;
-        chunk_idx += 1;
     }
 
-    if let Some(ref bar) = pb {
+    if let Some(bar) = pb.as_deref() {
         bar.finish_and_clear();
     }
 
@@ -384,10 +461,14 @@ async fn cmd_sync(args: SyncArgs) {
         );
     }
 
-    let result = zcash_grpc::sync::SyncResult {
+    let result = zcash_sync::sync::SyncResult {
         transactions: all_transactions,
         blocks_scanned: total_blocks_scanned,
         elapsed_ms: global_start.elapsed().as_millis() as u64,
+        stream_wait_ms: 0,
+        trial_decrypt_ms: 0,
+        get_transaction_ms: 0,
+        full_decrypt_ms: 0,
     };
 
     match args.format {
@@ -507,7 +588,7 @@ async fn cmd_sync(args: SyncArgs) {
                 println!("{sep2}");
             }
             Format::Json => {
-                let pool_notes = |notes: &[zcash_grpc::sync::ShieldedNote]| {
+                let pool_notes = |notes: &[zcash_sync::sync::ShieldedNote]| {
                     notes
                         .iter()
                         .map(|n| {

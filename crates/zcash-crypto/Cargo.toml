@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 # zcash_client_backend: only the `orchard` feature is needed here.
 # The `lightwalletd-tonic` feature (gRPC client + proto types) is NOT included
-# so that this crate remains free of tonic/tokio and compiles cleanly for mobile targets.
+# so that this crate remains free of tonic/tokio and compiles cleanly for ffi targets.
 zcash_client_backend  = { workspace = true, features = ["orchard"] }
 zcash_keys            = { workspace = true }
 zcash_address         = { workspace = true }
@@ -27,5 +27,6 @@ bitcoin               = { workspace = true }
 hex                   = { workspace = true }
 uuid                  = { workspace = true }
 thiserror             = { workspace = true }
+rayon                 = { workspace = true }
 # Forces the `std` feature so zcash_client_backend can call OffsetDateTime::now_utc().
 time                  = { workspace = true }

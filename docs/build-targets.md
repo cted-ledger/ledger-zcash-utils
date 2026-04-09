@@ -17,59 +17,6 @@ The `.node` file is loaded by `index.js` which is the npm package entry point.
 
 ---
 
-## Android (`scripts/build-android.sh`)
-
-**Prerequisites:**
-- Android NDK r26+ — set `ANDROID_NDK_HOME` or `ANDROID_HOME` (NDK auto-detected from `$ANDROID_HOME/ndk/`)
-- `cargo-ndk`: `cargo install cargo-ndk`
-
-**Output:**
-```
-dist/android/
-  jniLibs/arm64-v8a/libzcash_ffi_mobile.so
-  jniLibs/armeabi-v7a/libzcash_ffi_mobile.so
-  jniLibs/x86/libzcash_ffi_mobile.so
-  jniLibs/x86_64/libzcash_ffi_mobile.so
-  kotlin/app/zcash/uniffi/zcash.kt
-```
-
-```bash
-# If ANDROID_HOME is set (e.g. ~/Library/Android/sdk), NDK is auto-detected:
-./scripts/build-android.sh
-
-# Or set the NDK path explicitly:
-ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/28.0.12674087 \
-    ./scripts/build-android.sh
-```
-
-Copy `jniLibs/` into your Android project's `src/main/` directory.
-Copy `zcash.kt` into your Kotlin source tree.
-
----
-
-## iOS (`scripts/build-ios.sh`)
-
-**Prerequisites:**
-- macOS with Xcode installed
-- Xcode command line tools: `xcode-select --install`
-
-**Output:**
-```
-dist/ios/
-  ZcashFFI.xcframework/    (drag into Xcode project)
-  swift/zcash.swift        (copy into Swift source)
-  swift/zcashFFI.h         (included in XCFramework headers)
-```
-
-```bash
-./scripts/build-ios.sh
-```
-
-In Xcode: drag `ZcashFFI.xcframework` into your project → Frameworks,
-Libraries, and Embedded Content. Copy `zcash.swift` into your Swift target.
-
----
-
 ## CLI — macOS universal (`scripts/build-cli-macos.sh`)
 
 **Prerequisites:**

@@ -1,6 +1,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use orchard::{
     keys::{PreparedIncomingViewingKey as PreparedOrchardIvk, Scope},
     note::{
@@ -20,12 +22,12 @@ use uuid::Uuid;
 use zcash_address::unified::{Encoding, Ufvk};
 use zcash_client_backend::decrypt_transaction;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_note_encryption::{try_compact_note_decryption, EphemeralKeyBytes, COMPACT_NOTE_SIZE};
+use zcash_note_encryption::{batch, EphemeralKeyBytes, COMPACT_NOTE_SIZE};
 use zcash_primitives::{
     consensus::{BlockHeight, BranchId},
     transaction::Transaction as ZcashTransaction,
 };
-use zcash_protocol::{consensus::Network, memo::MemoBytes, value::Zatoshis};
+use zcash_protocol::{consensus::Network, memo::MemoBytes, value::{BalanceError, Zatoshis}};
 
 use crate::error::Error;
 
@@ -34,7 +36,7 @@ use crate::error::Error;
 // These types represent compact block data as streamed by lightwalletd.
 // They are intentionally decoupled from any proto/tonic dependency so this
 // crate compiles for all targets including iOS and Android.
-// The `zcash-grpc` crate converts proto `CompactTx` → `CompactTransaction` before
+// The `zcash-sync` crate converts proto `CompactTx` → `CompactTransaction` before
 // calling `trial_decrypt_block`.
 
 /// A compact Sapling output as found in a lightwalletd compact block.
@@ -51,6 +53,9 @@ pub struct CompactSaplingOutput {
 /// A compact Orchard action as found in a lightwalletd compact block.
 #[derive(Debug, Clone)]
 pub struct CompactOrchardAction {
+    /// Spent nullifier (nf, 32 bytes). Used in Phase 4 to detect outgoing transactions
+    /// by matching against nullifiers of previously received notes.
+    pub nf: Vec<u8>,
     /// Note commitment (cmx, 32 bytes).
     pub cmx: Vec<u8>,
     /// Ephemeral public key (32 bytes).
@@ -93,6 +98,11 @@ pub struct DecryptedOutput {
     pub memo: String,
     /// `"incoming"`, `"outgoing"`, or `"internal"`.
     pub transfer_type: String,
+    /// Orchard nullifier for this note (32 bytes).
+    /// `Some` for incoming/internal Orchard notes; `None` for Sapling or outgoing.
+    /// Used by the sync engine to detect when received notes are later spent
+    /// (outgoing transactions that would otherwise be invisible to trial decryption).
+    pub nullifier: Option<[u8; 32]>,
 }
 
 /// All decrypted outputs from a single transaction.
@@ -106,6 +116,42 @@ pub struct DecryptedTx {
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
+
+/// Determine the correct [`Zip212Enforcement`] for Sapling trial decryption at
+/// a given block height.
+///
+/// ZIP-212 (Heartwood) changed the Sapling note plaintext format.  Notes in
+/// blocks below the activation height must be decrypted with `Off`; those at
+/// or above use `On`.  A 32 256-block grace period immediately after activation
+/// accepted both formats — we model that with `GracePeriod`.
+///
+/// Activation heights (inclusive):
+/// - Mainnet : 903 800
+/// - Testnet : 1 028 500
+fn zip212_enforcement(network: &Network, height: u32) -> Zip212Enforcement {
+    // Heartwood (ZIP-212) activation heights — hardcoded because
+    // zcash_protocol::consensus::Network does not expose per-network upgrade
+    // heights reliably via the Parameters trait in the versions we target.
+    //
+    // Source: https://zips.z.cash/zip-0212
+    //   Mainnet : 903 800
+    //   Testnet : 1 028 500
+    let heartwood: u32 = match network {
+        Network::MainNetwork => 903_800,
+        Network::TestNetwork => 1_028_500,
+    };
+    // 32 256-block grace period: both pre- and post-ZIP-212 note plaintexts
+    // are valid, so use GracePeriod to accept either format.
+    if height >= heartwood {
+        if height < heartwood + 32_256 {
+            Zip212Enforcement::GracePeriod
+        } else {
+            Zip212Enforcement::On
+        }
+    } else {
+        Zip212Enforcement::Off
+    }
+}
 
 /// Decode a [`MemoBytes`] to a UTF-8 string, stripping trailing null bytes.
 pub(crate) fn decode_memo(memo: MemoBytes) -> String {
@@ -168,8 +214,6 @@ pub fn prepare_ivks(viewing_key: &str) -> Result<PreparedIvks, Error> {
 }
 
 /// Convenience wrapper: prepare IVKs and wrap in an [`Arc`] for shared ownership.
-///
-/// This is used by the UniFFI mobile binding's opaque `PreparedIvksHandle`.
 pub fn prepare_ivks_arc(viewing_key: &str) -> Result<Arc<PreparedIvks>, Error> {
     prepare_ivks(viewing_key).map(Arc::new)
 }
@@ -178,52 +222,200 @@ pub fn prepare_ivks_arc(viewing_key: &str) -> Result<Arc<PreparedIvks>, Error> {
 ///
 /// Returns the txids (big-endian hex) of transactions that match our IVKs.
 ///
-/// This is the hot path in block scanning — allocates on the heap only when a
-/// match is found. The function processes Sapling outputs first, then Orchard
-/// actions, short-circuiting as soon as any match is detected per transaction.
-pub fn trial_decrypt_block(txs: &[CompactTransaction], ivks: &PreparedIvks) -> Vec<String> {
-    let sapling_domain = SaplingDomain::new(Zip212Enforcement::On);
-    let mut matched = Vec::new();
+/// Strategy: split all outputs in the block into `rayon::current_num_threads()`
+/// chunks, each processed with `batch::try_compact_note_decryption`. This
+/// combines two optimisations:
+/// - Batch API: each chunk uses one `batch_to_affine()` instead of N inversions.
+/// - Rayon: chunks run in parallel across all available CPU cores.
+pub fn trial_decrypt_block(
+    txs: &[CompactTransaction],
+    ivks: &PreparedIvks,
+    height: u32,
+    network: &Network,
+) -> Vec<String> {
+    let sapling_ivks: Vec<PreparedSaplingIvk> =
+        ivks.sapling.iter().map(|(ivk, _)| ivk.clone()).collect();
+    let orchard_ivks: Vec<PreparedOrchardIvk> =
+        ivks.orchard.iter().map(|(ivk, _)| ivk.clone()).collect();
 
-    for tx in txs {
-        let mut found = false;
+    // Compute the correct ZIP-212 enforcement for this block height once.
+    let zip212 = zip212_enforcement(network, height);
 
-        // --- Sapling outputs ---
-        'sapling: for output in &tx.sapling_outputs {
-            let Ok(compact_output) = parse_compact_sapling_output(output) else {
-                continue;
-            };
-            for (ivk, _) in &ivks.sapling {
-                if try_compact_note_decryption(&sapling_domain, ivk, &compact_output).is_some() {
-                    found = true;
-                    break 'sapling;
-                }
-            }
-        }
+    // ── Collect parsed outputs tagged with tx index ───────────────────────────
+    let sapling_raw: Vec<(usize, CompactOutputDescription)> = txs
+        .iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            tx.sapling_outputs.iter().filter_map(move |o| {
+                parse_compact_sapling_output(o).ok().map(|parsed| (tx_idx, parsed))
+            })
+        })
+        .collect();
 
-        // --- Orchard actions (only if not already matched via Sapling) ---
-        if !found {
-            'orchard: for action in &tx.orchard_actions {
-                let Ok(compact_action) = parse_compact_orchard_action(action) else {
-                    continue;
-                };
-                let orchard_domain = OrchardDomain::for_compact_action(&compact_action);
-                for (ivk, _) in &ivks.orchard {
-                    if try_compact_note_decryption(&orchard_domain, ivk, &compact_action).is_some()
-                    {
-                        found = true;
-                        break 'orchard;
-                    }
-                }
-            }
-        }
-
-        if found {
-            matched.push(tx.txid.clone());
+    {
+        let total: usize = txs.iter().map(|tx| tx.sapling_outputs.len()).sum();
+        let skipped = total - sapling_raw.len();
+        if skipped > 0 {
+            eprintln!(
+                "WARN: trial_decrypt_block skipped {skipped} malformed Sapling output(s) at height {height}"
+            );
         }
     }
 
-    matched
+    let orchard_raw: Vec<(usize, CompactAction)> = txs
+        .iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            tx.orchard_actions.iter().filter_map(move |a| {
+                parse_compact_orchard_action(a).ok().map(|action| (tx_idx, action))
+            })
+        })
+        .collect();
+
+    {
+        let total: usize = txs.iter().map(|tx| tx.orchard_actions.len()).sum();
+        let skipped = total - orchard_raw.len();
+        if skipped > 0 {
+            eprintln!(
+                "WARN: trial_decrypt_block skipped {skipped} malformed Orchard action(s) at height {height}"
+            );
+        }
+    }
+
+    let n_threads = rayon::current_num_threads().max(1);
+
+    // ── Parallel chunked batch Sapling ────────────────────────────────────────
+    let sapling_matched: std::collections::HashSet<usize> = if sapling_raw.is_empty() {
+        Default::default()
+    } else {
+        let chunk_size = (sapling_raw.len() / n_threads).max(1);
+        sapling_raw
+            .par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                let outputs: Vec<(SaplingDomain, CompactOutputDescription)> = chunk
+                    .iter()
+                    .map(|(_, o)| (SaplingDomain::new(zip212), o.clone()))
+                    .collect();
+                let results = batch::try_compact_note_decryption(&sapling_ivks, &outputs);
+                chunk
+                    .iter()
+                    .zip(results)
+                    .filter_map(|((idx, _), r)| r.map(|_| *idx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    // ── Parallel chunked batch Orchard ────────────────────────────────────────
+    let orchard_matched: std::collections::HashSet<usize> = if orchard_raw.is_empty() {
+        Default::default()
+    } else {
+        let chunk_size = (orchard_raw.len() / n_threads).max(1);
+        orchard_raw
+            .par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                let outputs: Vec<(OrchardDomain, CompactAction)> = chunk
+                    .iter()
+                    .map(|(_, a)| (OrchardDomain::for_compact_action(a), a.clone()))
+                    .collect();
+                let results = batch::try_compact_note_decryption(&orchard_ivks, &outputs);
+                chunk
+                    .iter()
+                    .zip(results)
+                    .filter_map(|((idx, _), r)| r.map(|_| *idx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    txs.iter()
+        .enumerate()
+        .filter_map(|(i, tx)| {
+            if sapling_matched.contains(&i) || orchard_matched.contains(&i) {
+                Some(tx.txid.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Full decryption of a raw transaction hex using a pre-parsed UFVK.
+///
+/// This is the hot-path variant used by `run_sync()` where the UFVK is
+/// parsed once per sync and reused across all matched transactions.
+pub fn full_decrypt_tx_with_ufvk(
+    tx_hex: &str,
+    ufvk: &UnifiedFullViewingKey,
+    height: u32,
+    network: Network,
+) -> Result<DecryptedTx, Error> {
+    let account_id = Uuid::nil();
+
+    let branch_id = BranchId::for_height(&network, BlockHeight::from(height));
+
+    let tx_bytes = hex::decode(tx_hex)
+        .map_err(|e| Error::Decrypt(format!("hex decode failed: {:?}", e)))?;
+    let mut cursor = Cursor::new(tx_bytes);
+    let tx = ZcashTransaction::read(&mut cursor, branch_id)
+        .map_err(|e| Error::Decrypt(format!("TX parse failed: {:?}", e)))?;
+
+    let decrypted = decrypt_transaction(
+        &network,
+        Some(BlockHeight::from(height)),
+        None,
+        &tx,
+        &[(account_id, ufvk.clone())].into_iter().collect(),
+    );
+
+    let sapling_outputs = decrypted
+        .sapling_outputs()
+        .iter()
+        .map(|f| DecryptedOutput {
+            amount: decode_note_value(f.note_value()),
+            memo: decode_memo(f.memo().clone()),
+            transfer_type: decode_transfer_type(f.transfer_type()),
+            nullifier: None, // Sapling nullifier tracking not needed (Ledger is Orchard-only)
+        })
+        .collect();
+
+    let orchard_outputs = decrypted
+        .orchard_outputs()
+        .iter()
+        .map(|f| {
+            // Compute the nullifier for incoming/internal notes so the sync engine
+            // can later detect when these notes are spent (Phase 4 outgoing-tx detection).
+            // Outgoing notes do not generate a nullifier we need to track.
+            let nullifier = if matches!(
+                f.transfer_type(),
+                zcash_client_backend::TransferType::Outgoing
+            ) {
+                None
+            } else {
+                ufvk.orchard().map(|fvk| f.note().nullifier(fvk).to_bytes())
+            };
+            DecryptedOutput {
+                amount: decode_note_value(f.note_value()),
+                memo: decode_memo(f.memo().clone()),
+                transfer_type: decode_transfer_type(f.transfer_type()),
+                nullifier,
+            }
+        })
+        .collect();
+
+    // Use TransactionData::fee_paid for an accurate protocol-level fee calculation.
+    // For fully-shielded transactions this gives the exact fee. For transactions
+    // with transparent inputs we don't have prevout values from compact blocks,
+    // so get_prevout returns None and fee_paid returns Ok(None) → we fall back to 0.
+    let fee_zatoshis = tx
+        .into_data()
+        .fee_paid(|_outpoint| -> Result<Option<Zatoshis>, BalanceError> { Ok(None) })
+        .ok()
+        .flatten()
+        .map(|z| z.into_u64() as i64)
+        .unwrap_or(0);
+
+    Ok(DecryptedTx { sapling_outputs, orchard_outputs, fee_zatoshis })
 }
 
 /// Full decryption of a raw transaction hex using the UFVK.
@@ -246,52 +438,7 @@ pub fn full_decrypt_tx(
         .map_err(|e| Error::Decrypt(format!("UFVK decode failed: {:?}", e)))?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk_str)
         .map_err(|e| Error::Decrypt(format!("UFVK parse failed: {:?}", e)))?;
-    let account_id = Uuid::nil();
-
-    let branch_id = BranchId::for_height(&network, BlockHeight::from(height));
-
-    let tx_bytes = hex::decode(tx_hex)
-        .map_err(|e| Error::Decrypt(format!("hex decode failed: {:?}", e)))?;
-    let mut cursor = Cursor::new(tx_bytes);
-    let tx = ZcashTransaction::read(&mut cursor, branch_id)
-        .map_err(|e| Error::Decrypt(format!("TX parse failed: {:?}", e)))?;
-
-    let decrypted = decrypt_transaction(
-        &network,
-        Some(BlockHeight::from(height)),
-        None,
-        &tx,
-        &[(account_id, ufvk)].into_iter().collect(),
-    );
-
-    let sapling_outputs = decrypted
-        .sapling_outputs()
-        .iter()
-        .map(|f| DecryptedOutput {
-            amount: decode_note_value(f.note_value()),
-            memo: decode_memo(f.memo().clone()),
-            transfer_type: decode_transfer_type(f.transfer_type()),
-        })
-        .collect();
-
-    let orchard_outputs = decrypted
-        .orchard_outputs()
-        .iter()
-        .map(|f| DecryptedOutput {
-            amount: decode_note_value(f.note_value()),
-            memo: decode_memo(f.memo().clone()),
-            transfer_type: decode_transfer_type(f.transfer_type()),
-        })
-        .collect();
-
-    // fee = valueBalanceSapling + valueBalanceOrchard
-    // Both ZatBalance values are positive when net value leaves the pool (fee + transparent out).
-    // For fully shielded transactions with no transparent I/O this equals the miner fee exactly.
-    let sapling_vb: i64 = tx.sapling_bundle().map(|b| i64::from(b.value_balance())).unwrap_or(0);
-    let orchard_vb: i64 = tx.orchard_bundle().map(|b| i64::from(b.value_balance())).unwrap_or(0);
-    let fee_zatoshis = (sapling_vb + orchard_vb).max(0);
-
-    Ok(DecryptedTx { sapling_outputs, orchard_outputs, fee_zatoshis })
+    full_decrypt_tx_with_ufvk(tx_hex, &ufvk, height, network)
 }
 
 // ─── compact type parsers ─────────────────────────────────────────────────────
@@ -380,8 +527,14 @@ pub(crate) fn parse_compact_orchard_action(
     )
     .ok_or_else(|| Error::Decrypt("invalid cmx commitment".into()))?;
 
-    // Nullifier is not needed for trial decryption — use a zero placeholder.
-    let nullifier = OrchardNullifier::from_bytes(&[0u8; 32]).unwrap();
+    // Use the actual spent nullifier from the compact block.
+    // Falls back to zero if the field is missing/malformed (trial decryption doesn't
+    // use the nullifier, so this only affects Phase 4 outgoing-tx detection which
+    // operates on raw bytes via CompactOrchardAction.nf directly).
+    let nf_bytes: [u8; 32] = action.nf.as_slice().try_into().unwrap_or([0u8; 32]);
+    let nullifier = OrchardNullifier::from_bytes(&nf_bytes)
+        .into_option()
+        .unwrap_or_else(|| OrchardNullifier::from_bytes(&[0u8; 32]).unwrap());
 
     Ok(CompactAction::from_parts(
         nullifier,
@@ -436,10 +589,13 @@ mod tests {
 
     // ── trial_decrypt_block — no-match path ───────────────────────────────────
 
+    // Test height safely above Heartwood on testnet (1_028_500) — ZIP-212 is On.
+    const TEST_HEIGHT: u32 = 1_900_000;
+
     #[test]
     fn test_trial_decrypt_block_empty_input() {
         let ivks = prepare_ivks(ALICE_UFVK).unwrap();
-        let result = trial_decrypt_block(&[], &ivks);
+        let result = trial_decrypt_block(&[], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
@@ -451,13 +607,13 @@ mod tests {
             sapling_outputs: vec![],
             orchard_actions: vec![],
         };
-        let result = trial_decrypt_block(&[tx], &ivks);
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_trial_decrypt_block_invalid_sapling_cmu_skipped() {
-        // A Sapling output with wrong cmu length is silently skipped (no panic).
+        // A Sapling output with wrong cmu length is skipped with a WARN log (no panic).
         let ivks = prepare_ivks(ALICE_UFVK).unwrap();
         let tx = CompactTransaction {
             txid: "aabbccdd".to_string(),
@@ -468,7 +624,7 @@ mod tests {
             }],
             orchard_actions: vec![],
         };
-        let result = trial_decrypt_block(&[tx], &ivks);
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty(), "invalid output should be skipped, not panic");
     }
 
@@ -479,12 +635,13 @@ mod tests {
             txid: "11223344".to_string(),
             sapling_outputs: vec![],
             orchard_actions: vec![CompactOrchardAction {
+                nf: vec![0u8; 32],
                 cmx: vec![0u8; 10], // wrong: should be 32
                 ephemeral_key: vec![0u8; 32],
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
         };
-        let result = trial_decrypt_block(&[tx], &ivks);
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
@@ -501,7 +658,7 @@ mod tests {
             }],
             orchard_actions: vec![],
         };
-        let result = trial_decrypt_block(&[tx], &ivks);
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
@@ -512,12 +669,13 @@ mod tests {
             txid: "feedface".to_string(),
             sapling_outputs: vec![],
             orchard_actions: vec![CompactOrchardAction {
+                nf: vec![0u8; 32],
                 cmx: vec![0u8; 32],
                 ephemeral_key: vec![0u8; 32],
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
         };
-        let result = trial_decrypt_block(&[tx], &ivks);
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
@@ -535,7 +693,7 @@ mod tests {
                 orchard_actions: vec![],
             })
             .collect();
-        let result = trial_decrypt_block(&txs, &ivks);
+        let result = trial_decrypt_block(&txs, &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
     }
 
@@ -582,6 +740,7 @@ mod tests {
     #[test]
     fn test_parse_orchard_wrong_cmx_length() {
         let action = CompactOrchardAction {
+            nf: vec![0u8; 32],
             cmx: vec![0u8; 16],
             ephemeral_key: vec![0u8; 32],
             ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
@@ -594,6 +753,7 @@ mod tests {
     #[test]
     fn test_parse_orchard_wrong_epk_length() {
         let action = CompactOrchardAction {
+            nf: vec![0u8; 32],
             cmx: vec![0u8; 32],
             ephemeral_key: vec![0u8; 5],
             ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
@@ -606,6 +766,7 @@ mod tests {
     #[test]
     fn test_parse_orchard_wrong_ciphertext_length() {
         let action = CompactOrchardAction {
+            nf: vec![0u8; 32],
             cmx: vec![0u8; 32],
             ephemeral_key: vec![0u8; 32],
             ciphertext: vec![0u8; 3],
@@ -640,6 +801,146 @@ mod tests {
         // bytes[3] = 0 (null terminator)
         let memo = MemoBytes::from_bytes(&bytes).unwrap();
         assert_eq!(decode_memo(memo), "abc");
+    }
+
+    // ── zip212_enforcement ────────────────────────────────────────────────────
+
+    // Heartwood activation: mainnet 903_800, testnet 1_028_500
+    // Grace period: [heartwood, heartwood + 32_256)
+    // After grace: [heartwood + 32_256, ∞)
+
+    #[test]
+    fn test_zip212_mainnet_below_heartwood() {
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_799), Zip212Enforcement::Off);
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 0), Zip212Enforcement::Off);
+    }
+
+    #[test]
+    fn test_zip212_mainnet_at_heartwood_is_grace_period() {
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800), Zip212Enforcement::GracePeriod);
+    }
+
+    #[test]
+    fn test_zip212_mainnet_within_grace_period() {
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_801), Zip212Enforcement::GracePeriod);
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800 + 32_255), Zip212Enforcement::GracePeriod);
+    }
+
+    #[test]
+    fn test_zip212_mainnet_after_grace_period() {
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800 + 32_256), Zip212Enforcement::On);
+        assert_eq!(zip212_enforcement(&Network::MainNetwork, 2_000_000), Zip212Enforcement::On);
+    }
+
+    #[test]
+    fn test_zip212_testnet_below_heartwood() {
+        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_499), Zip212Enforcement::Off);
+    }
+
+    #[test]
+    fn test_zip212_testnet_at_heartwood_is_grace_period() {
+        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_500), Zip212Enforcement::GracePeriod);
+    }
+
+    #[test]
+    fn test_zip212_testnet_after_grace_period() {
+        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_500 + 32_256), Zip212Enforcement::On);
+    }
+
+    // ── parse_compact_orchard_action — nf fallback ────────────────────────────
+
+    #[test]
+    fn test_parse_orchard_short_nf_falls_back_silently() {
+        // nf with wrong length: parse_compact_orchard_action should NOT error —
+        // it falls back to [0u8; 32]. Trial decryption doesn't use the nf field.
+        let action = CompactOrchardAction {
+            nf: vec![0u8; 5], // wrong length
+            cmx: vec![0u8; 32],
+            ephemeral_key: vec![0u8; 32],
+            ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+        };
+        // Should succeed (fallback to zero nf), not return an error
+        assert!(parse_compact_orchard_action(&action).is_ok());
+    }
+
+    #[test]
+    fn test_parse_orchard_empty_nf_falls_back_silently() {
+        let action = CompactOrchardAction {
+            nf: vec![], // empty
+            cmx: vec![0u8; 32],
+            ephemeral_key: vec![0u8; 32],
+            ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+        };
+        assert!(parse_compact_orchard_action(&action).is_ok());
+    }
+
+    // ── decode_memo — invalid UTF-8 ───────────────────────────────────────────
+
+    #[test]
+    fn test_decode_memo_invalid_utf8_returns_empty() {
+        // 0xFF 0xFE are not valid UTF-8 — unwrap_or_default() should return "".
+        let mut bytes = [0u8; 512];
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFE;
+        // bytes[2] stays 0 (null-terminator), so memo_len = 2, but the slice
+        // [0xFF, 0xFE] is invalid UTF-8 → unwrap_or_default → "".
+        let memo = MemoBytes::from_bytes(&bytes).unwrap();
+        assert_eq!(decode_memo(memo), "");
+    }
+
+    // ── trial_decrypt_block — mainnet network ─────────────────────────────────
+
+    #[test]
+    fn test_trial_decrypt_block_mainnet_height_no_panic() {
+        // Ensures the function runs correctly with mainnet network
+        // (different ZIP-212 boundary than testnet).
+        let ivks = prepare_ivks(ALICE_UFVK).unwrap();
+        let tx = CompactTransaction {
+            txid: "aabbccdd".to_string(),
+            sapling_outputs: vec![CompactSaplingOutput {
+                cmu: vec![0u8; 32],
+                ephemeral_key: vec![0u8; 32],
+                ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+            }],
+            orchard_actions: vec![],
+        };
+        // Below mainnet Heartwood (903_800) — ZIP-212 Off
+        let result = trial_decrypt_block(&[tx.clone()], &ivks, 500_000, &Network::MainNetwork);
+        assert!(result.is_empty());
+        // Above mainnet Heartwood + grace — ZIP-212 On
+        let result = trial_decrypt_block(&[tx], &ivks, 2_000_000, &Network::MainNetwork);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_trial_decrypt_block_only_returns_matching_txids() {
+        // With random/zero data, no txids should match. The result must be a
+        // strict subset of the input txids (never returns txids not in input).
+        let ivks = prepare_ivks(ALICE_UFVK).unwrap();
+        let txids = ["aaaa", "bbbb", "cccc"];
+        let txs: Vec<_> = txids
+            .iter()
+            .map(|id| CompactTransaction {
+                txid: id.to_string(),
+                sapling_outputs: vec![CompactSaplingOutput {
+                    cmu: vec![0u8; 32],
+                    ephemeral_key: vec![0u8; 32],
+                    ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+                }],
+                orchard_actions: vec![CompactOrchardAction {
+                    nf: vec![0u8; 32],
+                    cmx: vec![0u8; 32],
+                    ephemeral_key: vec![0u8; 32],
+                    ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+                }],
+            })
+            .collect();
+        let result = trial_decrypt_block(&txs, &ivks, TEST_HEIGHT, &Network::TestNetwork);
+        // All returned txids must be from the input set
+        let input_set: std::collections::HashSet<_> = txids.iter().copied().collect();
+        for txid in &result {
+            assert!(input_set.contains(txid.as_str()), "unexpected txid in result: {txid}");
+        }
     }
 
     // ── full_decrypt_tx — error paths ─────────────────────────────────────────

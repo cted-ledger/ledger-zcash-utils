@@ -33,7 +33,7 @@ jobs:
         run: pnpm install
 
       - name: Build NAPI addon
-        run: pnpm build
+        run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 
       - name: Run Rust tests
         run: cargo test --workspace
