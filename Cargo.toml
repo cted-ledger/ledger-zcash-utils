@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/zcash-crypto",
+    "crates/zcash-sync",
+    "crates/zcash-cli",
 ]
 default-members = ["crates/zcash-crypto"]
 
@@ -22,12 +24,17 @@ zip32                 = "0.2"
 orchard               = { version = "0.11", default-features = false }
 sapling-crypto        = { version = "0.5", default-features = false }
 
+# Async / gRPC (only zcash-sync and its dependents need these)
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["codegen", "transport", "tls-native-roots", "tls-ring"] }
+
 # Key derivation
 bip39   = "2"
 bitcoin = "0.32"
 
 # Parallelism
 rayon   = "1"
+futures = "0.3"
 
 # Utilities
 anyhow     = "1"
