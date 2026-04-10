@@ -115,7 +115,7 @@ jobs:
   # ── Step 2: Publish npm + attach CLI binaries to GitHub Release ──────────────
   publish:
     name: Publish to npm
-    runs-on: ubuntu-latest
+    runs-on: public-ledgerhq-shared-medium
     needs: [build-napi, build-cli]
 
     steps:
@@ -157,14 +157,28 @@ jobs:
       - name: Cargo tests (host only)
         run: cargo test --workspace
 
-      - name: Create Release PR or Publish
+      - name: 🔑 Login to JFrog Ledger
+        id: jfrog-login-publish
+        uses: LedgerHQ/actions-security/actions/jfrog-login@actions/jfrog-login-1
+
+      - name: ⚙️ Configure npmrc
+        shell: bash
+        env:
+          INPUTS_REGISTRY: ${{ vars.ARTIFACTORY_PUBLISH_URL  }}
+          INPUTS_TOKEN: ${{ steps.jfrog-login-publish.outputs.oidc-token }}
+        run: |
+          cat << EOF | tee ".npmrc"
+          @ledgerhq:registry=https://${INPUTS_REGISTRY}/
+          //${INPUTS_REGISTRY}/:_authToken=${INPUTS_TOKEN}
+          EOF
+
+      - name: 🚀 Create Release PR or Publish to Ledger JFrog
         id: changesets
         uses: changesets/action@v1
         with:
           publish: pnpm changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Attach CLI binaries to the GitHub Release created by changesets
       - name: Attach CLI binaries to GitHub Release
