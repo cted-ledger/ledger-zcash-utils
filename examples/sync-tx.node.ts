@@ -11,18 +11,19 @@
  *
  * Options:
  *   --network <mainnet|testnet>   [default: testnet]
- *   --grpc-url <URL>              [default: https://testnet.zec.rocks:443]
+ *   --grpc-url <URL>              [default: https://zaino-zec-testnet.nodes.stg.ledger-test.com/]
  *   --start-height <N>            [default: Sapling activation height]
  *   --end-height <N>              [default: chain tip]
  *   --chunk-size <N>              Blocks per gRPC call [default: 50000]
  *   --expected-txids <a,b,...>    Comma-separated txids to assert presence of
+ *   --verbose                     Emit Rust diagnostics to stderr every 10s
  *
  * Alice's seed (never use with real funds — public test vector):
  *   wish puppy smile loan doll curve hole maze file ginger hair nose
  *   key relax knife witness cannon grab despair throw review deal slush frame
  */
 import { parseArgs } from "node:util";
-import { syncShielded, getChainTip, SyncResult, ShieldedNote } from "..";
+import { startSync, getChainTip, ShieldedTransaction, ShieldedNote } from "..";
 
 // ── Alice's UFVK (testnet, account index 0) ──────────────────────────────────
 const ALICE_UFVK =
@@ -31,8 +32,8 @@ const ALICE_UFVK =
 // ── Config ────────────────────────────────────────────────────────────────────
 const SAPLING_ACTIVATION: Record<string, number> = { testnet: 280_000, mainnet: 419_200 };
 const DEFAULT_GRPC: Record<string, string> = {
-  testnet: "https://testnet.zec.rocks:443",
-  mainnet: "https://zec.rocks:443",
+  testnet: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  mainnet: "https://zaino-zec-mainnet-zebra.nodes.stg.ledger-test.com/",
 };
 
 const { values } = parseArgs({
@@ -41,8 +42,9 @@ const { values } = parseArgs({
     "grpc-url":       { type: "string" },
     "start-height":   { type: "string" },
     "end-height":     { type: "string" },
-    "chunk-size":     { type: "string", default: "50000" },
-    "expected-txids": { type: "string", default: "" },
+    "chunk-size":     { type: "string",  default: "50000" },
+    "expected-txids": { type: "string",  default: "" },
+    "verbose":        { type: "boolean", default: false },
   },
 });
 
@@ -58,6 +60,7 @@ const rawStart          = values["start-height"] ? Number(values["start-height"]
 const startHeight       = Math.max(rawStart, saplingActivation);
 const endHeightOverride = values["end-height"] ? Number(values["end-height"]) : null;
 const chunkSize         = Number(values["chunk-size"]);
+const verbose           = values["verbose"]!;
 const expectedTxids     = values["expected-txids"]!
   .split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -135,7 +138,7 @@ console.log();
 
 const t0 = Date.now();
 let totalBlocksScanned = 0;
-const allTransactions: SyncResult["transactions"] = [];
+const allTransactions: ShieldedTransaction[] = [];
 
 for (let i = 0; i < chunks.length; i++) {
   const { from, to } = chunks[i];
@@ -146,24 +149,34 @@ for (let i = 0; i < chunks.length; i++) {
     `${from.toLocaleString()}–${to.toLocaleString()}  (${pct}%  ${elapsedS}s elapsed)  … `
   );
 
-  let chunk: SyncResult;
+  let chunkTxs: ShieldedTransaction[];
+  let chunkBlocksScanned: number;
+  let chunkElapsedMs: number;
   try {
-    chunk = await syncShielded({ grpcUrl, viewingKey: ALICE_UFVK, startHeight: from, endHeight: to, network });
+    const stream = await startSync({ grpcUrl, viewingKey: ALICE_UFVK, startHeight: from, endHeight: to, network, verbose });
+    chunkTxs = [];
+    let tx: ShieldedTransaction | null;
+    while ((tx = await stream.next()) !== null) {
+      chunkTxs.push(tx);
+    }
+    const chunkStats = await stream.stats();
+    chunkBlocksScanned = chunkStats.blocksScanned;
+    chunkElapsedMs = chunkStats.elapsedMs;
   } catch (err) {
     console.error(`\n\nSync failed on chunk ${from}–${to}:\n  ${(err as Error).message}`);
     process.exit(1);
   }
 
-  totalBlocksScanned += chunk.blocksScanned;
-  allTransactions.push(...chunk.transactions);
+  totalBlocksScanned += chunkBlocksScanned;
+  allTransactions.push(...chunkTxs);
 
-  const blps  = Math.round(chunk.blocksScanned / (chunk.elapsedMs / 1_000));
-  const txTag = chunk.transactions.length > 0 ? `  *** ${chunk.transactions.length} tx found ***` : "";
+  const blps  = Math.round(chunkBlocksScanned / (chunkElapsedMs / 1_000));
+  const txTag = chunkTxs.length > 0 ? `  *** ${chunkTxs.length} tx found ***` : "";
   console.log(`${blps.toLocaleString()} bl/s${txTag}`);
 }
 
 const wallMs = Date.now() - t0;
-const result: SyncResult = { transactions: allTransactions, blocksScanned: totalBlocksScanned, elapsedMs: wallMs };
+const result = { transactions: allTransactions, blocksScanned: totalBlocksScanned, elapsedMs: wallMs };
 
 // 4. Summary
 const blps = result.blocksScanned / (result.elapsedMs / 1_000);

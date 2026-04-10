@@ -7,12 +7,13 @@
  *
  * Options:
  *   --viewing-key <UFVK>   Unified Full Viewing Key  [default: Alice testnet UFVK]
- *   --grpc-url <URL>       gRPC endpoint             [default: https://testnet.zec.rocks:443]
+ *   --grpc-url <URL>       gRPC endpoint             [default: https://zaino-zec-testnet.nodes.stg.ledger-test.com/]
  *   --start-height <N>     First block (inclusive)   [default: 280000]
  *   --end-height <N>       Last block (inclusive)    [default: 285000]
+ *   --verbose              Emit Rust diagnostics to stderr every 10s
  */
 import { parseArgs } from "node:util";
-import { syncShielded, SyncResult } from "..";
+import { startSync, ShieldedTransaction } from "..";
 
 // Alice's UFVK — public test vector, never use with real funds.
 const ALICE_UFVK =
@@ -21,9 +22,10 @@ const ALICE_UFVK =
 const { values } = parseArgs({
   options: {
     "viewing-key":  { type: "string",  default: ALICE_UFVK },
-    "grpc-url":     { type: "string",  default: "https://testnet.zec.rocks:443" },
+    "grpc-url":     { type: "string",  default: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/" },
     "start-height": { type: "string",  default: "280000" },
     "end-height":   { type: "string",  default: "285000" },
+    "verbose":      { type: "boolean", default: false },
   },
 });
 
@@ -31,22 +33,29 @@ const viewingKey  = values["viewing-key"]!;
 const grpcUrl     = values["grpc-url"]!;
 const startHeight = Number(values["start-height"]);
 const endHeight   = Number(values["end-height"]);
+const verbose     = values["verbose"]!;
 
 console.log(`Scanning blocks ${startHeight}–${endHeight} via ${grpcUrl} ...`);
 
-const result: SyncResult = await syncShielded({ grpcUrl, viewingKey, startHeight, endHeight });
+const stream = await startSync({ grpcUrl, viewingKey, startHeight, endHeight, verbose });
+const transactions: ShieldedTransaction[] = [];
+let tx: ShieldedTransaction | null;
+while ((tx = await stream.next()) !== null) {
+  transactions.push(tx);
+}
+const stats = await stream.stats();
 
-const blps = result.blocksScanned / (result.elapsedMs / 1000);
+const blps = stats.blocksScanned / (stats.elapsedMs / 1000);
 
 console.log(`\nResults:`);
-console.log(`  Blocks scanned : ${result.blocksScanned}`);
-console.log(`  Elapsed        : ${result.elapsedMs.toFixed(0)} ms`);
+console.log(`  Blocks scanned : ${stats.blocksScanned}`);
+console.log(`  Elapsed        : ${stats.elapsedMs.toFixed(0)} ms`);
 console.log(`  Speed          : ${Math.round(blps).toLocaleString()} bl/s`);
-console.log(`  Transactions   : ${result.transactions.length}`);
+console.log(`  Transactions   : ${transactions.length}`);
 
-if (result.transactions.length > 0) {
+if (transactions.length > 0) {
   console.log(`\nMatched transactions:`);
-  for (const tx of result.transactions) {
+  for (const tx of transactions) {
     const notes = [...tx.saplingNotes, ...tx.orchardNotes];
     const total = notes.reduce((s, n) => s + n.amount, 0);
     console.log(`  ${tx.txid}  height=${tx.blockHeight}  total=${total} zat  fee=${tx.fee} zat`);
