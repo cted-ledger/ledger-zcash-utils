@@ -2,8 +2,8 @@ name: Publish Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*"
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -112,11 +112,14 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
-  # ── Step 2: Publish npm + attach CLI binaries to GitHub Release ──────────────
+  # ── Step 2: Publish to JFrog + attach CLI binaries to GitHub Release ─────────
   publish:
-    name: Publish to npm
-    runs-on: ubuntu-latest
+    name: Publish to JFrog
+    runs-on: public-ledgerhq-shared-medium
     needs: [build-napi, build-cli]
+    permissions:
+      id-token: write
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +130,6 @@ jobs:
         with:
           node-version: ${{ vars.NODE_VERSION || '20' }}
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install
@@ -157,21 +159,27 @@ jobs:
       - name: Cargo tests (host only)
         run: cargo test --workspace
 
-      - name: Create Release PR or Publish
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          publish: pnpm changeset publish
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: 🔑 Login to JFrog Ledger
+        id: jfrog-login-publish
+        uses: LedgerHQ/actions-security/actions/jfrog-login@actions/jfrog-login-1
 
-      # Attach CLI binaries to the GitHub Release created by changesets
-      - name: Attach CLI binaries to GitHub Release
-        if: steps.changesets.outputs.published == 'true'
+      - name: ⚙️ Configure npmrc
+        shell: bash
+        env:
+          INPUTS_REGISTRY: ${{ vars.ARTIFACTORY_PUBLISH_URL }}
+          INPUTS_TOKEN: ${{ steps.jfrog-login-publish.outputs.oidc-token }}
+        run: |
+          cat << EOF >> "${HOME}/.npmrc"
+          @ledgerhq:registry=https://${INPUTS_REGISTRY}/
+          //${INPUTS_REGISTRY}/:_authToken=${INPUTS_TOKEN}
+          EOF
+
+      - name: 🚀 Publish to JFrog
+        run: pnpm changeset publish
+
+      - name: 📎 Attach CLI binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ fromJson(steps.changesets.outputs.publishedPackages)[0].version }}
           files: |
             dist/ledger-zcash-cli-macos-universal
             dist/ledger-zcash-cli-linux-x86_64
