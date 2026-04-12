@@ -6,11 +6,11 @@ runtime targets.
 
 ## Build targets
 
-| Target | Script | Output |
-|--------|--------|--------|
-| Node.js / Electron | `./scripts/build-napi.sh` | `index.*.node` |
+| Target                | Script                         | Output                                  |
+| --------------------- | ------------------------------ | --------------------------------------- |
+| Node.js / Electron    | `./scripts/build-napi.sh`      | `index.*.node`                          |
 | macOS CLI (universal) | `./scripts/build-cli-macos.sh` | `dist/ledger-zcash-cli-macos-universal` |
-| Linux CLI (static) | `./scripts/build-cli-linux.sh` | `dist/ledger-zcash-cli-linux-x86_64` |
+| Linux CLI (static)    | `./scripts/build-cli-linux.sh` | `dist/ledger-zcash-cli-linux-x86_64`    |
 
 See [`docs/build-targets.md`](docs/build-targets.md) for prerequisites and details.
 
@@ -105,22 +105,24 @@ git push
 
 ### Artifacts produced per release
 
-| Artifact | Distribution | Platforms |
-|----------|-------------|-----------|
-| `@ledgerhq/zcash-utils` | npm | All (bundled `.node` files) |
-| `ledger-zcash-cli-macos-universal` | GitHub Release | macOS arm64 + x64 |
-| `ledger-zcash-cli-linux-x86_64` | GitHub Release | Linux x64 (static musl) |
+| Artifact                           | Distribution       | Platforms                   |
+| ---------------------------------- | ------------------ | --------------------------- |
+| `@ledgerhq/zcash-utils`            | Ledger JFrog (npm) | All (bundled `.node` files) |
+| `ledger-zcash-cli-macos-universal` | GitHub Release     | macOS arm64 + x64           |
+| `ledger-zcash-cli-linux-x86_64`    | GitHub Release     | Linux x64 (static musl)     |
 
 The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
 
+The npm package is published to the internal Ledger JFrog Artifactory registry. The CI authenticates via OIDC (`LedgerHQ/actions-security/actions/jfrog-login`) and configures `.npmrc` to route `@ledgerhq` scoped packages to the Artifactory URL.
+
 CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are not part of the npm package.
 
-### Required secrets
+### Required secrets and variables
 
-| Secret | Purpose |
-|--------|---------|
-| `NPM_TOKEN` | npm authentication for `pnpm publish` |
-| `GITHUB_TOKEN` | Automatically provided by GitHub Actions |
+| Secret / Variable              | Purpose                                               |
+| ------------------------------ | ----------------------------------------------------- |
+| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions              |
+| `vars.ARTIFACTORY_PUBLISH_URL` | JFrog Artifactory registry URL (without `https://`)  |
 
 ## License
 
