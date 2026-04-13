@@ -102,6 +102,15 @@ export declare class TransactionStream {
    */
   next(): Promise<ShieldedTransaction | null>
   /**
+   * Cancels the background scan immediately.
+   *
+   * Aborts the tokio task running the sync engine. Any buffered transactions
+   * already sent by Rust are still consumable via `next()`, which will then
+   * return `null` once the buffer is drained. `stats()` will return an error
+   * after cancellation.
+   */
+  cancel(): void
+  /**
    * Returns scan statistics once the stream is exhausted (i.e. after `next()`
    * returns `null`). Calling this before the stream is done will wait until
    * the background sync task finishes.

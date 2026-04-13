@@ -92,6 +92,7 @@ pub struct SyncStats {
 pub struct TransactionStream {
     rx: mpsc::UnboundedReceiver<GrpcTx>,
     result_rx: Option<oneshot::Receiver<Result<GrpcSyncResult, String>>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[napi]
@@ -103,6 +104,21 @@ impl TransactionStream {
     #[napi]
     pub async unsafe fn next(&mut self) -> napi::Result<Option<ShieldedTransaction>> {
         Ok(self.rx.recv().await.map(grpc_tx_to_napi))
+    }
+
+    /// Cancels the background scan immediately.
+    ///
+    /// Aborts the tokio task running the sync engine. Any buffered transactions
+    /// already sent by Rust are still consumable via `next()`, which will then
+    /// return `null` once the buffer is drained. `stats()` will return an error
+    /// after cancellation.
+    #[napi]
+    pub fn cancel(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+        // Close the receiver so next() returns null once buffered items are drained.
+        self.rx.close();
     }
 
     /// Returns scan statistics once the stream is exhausted (i.e. after `next()`
@@ -163,7 +179,7 @@ pub async fn start_sync(params: SyncParams) -> napi::Result<TransactionStream> {
         on_transaction: Some(on_transaction),
     };
 
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         let result = run_sync(grpc_params).await.map_err(|e| e.to_string());
         // Ignore send errors: if the receiver was dropped stats are not needed.
         let _ = result_sender.send(result);
@@ -172,6 +188,7 @@ pub async fn start_sync(params: SyncParams) -> napi::Result<TransactionStream> {
     Ok(TransactionStream {
         rx: tx_receiver,
         result_rx: Some(result_receiver),
+        task_handle: Some(task_handle),
     })
 }
 
