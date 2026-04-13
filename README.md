@@ -1,128 +1,126 @@
 # @ledgerhq/zcash-utils
 
-Rust workspace for Zcash cryptographic operations. Provides key derivation,
-shielded transaction decryption, and compact block scanning across multiple
-runtime targets.
+Native Node.js (NAPI) addon for Zcash shielded transaction scanning — built in Rust via [napi-rs](https://napi.rs).
 
-## Build targets
+## Installation
 
-| Target                | Script                         | Output                                  |
-| --------------------- | ------------------------------ | --------------------------------------- |
-| Node.js / Electron    | `./scripts/build-napi.sh`      | `index.*.node`                          |
-| macOS CLI (universal) | `./scripts/build-cli-macos.sh` | `dist/ledger-zcash-cli-macos-universal` |
-| Linux CLI (static)    | `./scripts/build-cli-linux.sh` | `dist/ledger-zcash-cli-linux-x86_64`    |
-
-See [`docs/build-targets.md`](docs/build-targets.md) for prerequisites and details.
-
-## Crate structure
-
-```
-zcash-crypto     Pure cryptographic logic (key derivation, trial/full decryption)
-zcash-sync       Async sync engine (lightwalletd / Zaino)
-zcash-ffi-node   Node.js / Electron native addon (napi-rs)
-zcash-cli        CLI binary (ledger-zcash-cli)
+```sh
+npm install @ledgerhq/zcash-utils
+# or
+pnpm add @ledgerhq/zcash-utils
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the dependency graph and
-design decisions.
+## Quick start
 
-## CLI usage
+```typescript
+import { startSync, getChainTip } from "@ledgerhq/zcash-utils";
 
-```bash
-# Key derivation
-ledger-zcash-cli derive --mnemonic "abandon abandon ... about" --format json
+const tip = await getChainTip(
+  "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+);
 
-# Query chain tip
-ledger-zcash-cli tip --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/
+const stream = await startSync({
+  grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  viewingKey: "uviewtest1...",
+  startHeight: tip - 1000,
+  endHeight: tip,
+  network: "testnet",
+  orchardOnly: true,
+});
 
-# Scan a block range
-ledger-zcash-cli sync \
-    --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/ \
-    --viewing-key uviewtest1... \
-    --start-height 280000 \
-    --end-height 285000 \
-    --network testnet \
-    --format json
+let tx;
+while ((tx = await stream.next()) !== null) {
+  console.log(tx.txid, tx.orchardNotes);
+}
+
+const stats = await stream.stats();
+console.log(`Scanned ${stats.blocksScanned} blocks in ${stats.elapsedMs}ms`);
 ```
 
-### `derive` options
+## API
 
-```
---mnemonic <WORDS>      BIP-39 mnemonic (reads from stdin if omitted)
---account <N>           ZIP-32 account index [default: 0]
---xpub-path <PATH>      BIP-32 xpub path [default: m/44'/133'/{account}']
---network mainnet|testnet [default: mainnet]
---no-sapling            Exclude Sapling FVK from UFVK
---format human|json     [default: human]
-```
+### `startSync(params: SyncParams): Promise<TransactionStream>`
 
-## Development
+Starts scanning a range of compact blocks and returns a transaction stream. The scan runs in the background immediately in Rust — no JS event loop blocking. `GetTransaction` is called only for matched transactions.
 
-```bash
-# Run all logic tests
-cargo test --package zcash-crypto
+### `getChainTip(grpcUrl: string): Promise<number>`
 
-# Run CLI integration tests
-cargo test --package zcash-cli
+Returns the current chain tip height from the gRPC endpoint.
 
-# Coverage (requires cargo install cargo-llvm-cov)
-./scripts/coverage.sh
+### `TransactionStream`
 
-# Type-check everything
-cargo check --workspace
-```
+Async iterator over matched shielded transactions.
 
-## Documentation
+| Method                                         | Description                                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `next(): Promise<ShieldedTransaction \| null>` | Returns the next matched transaction, or `null` when the scan is complete.                        |
+| `cancel(): void`                               | Cancels the background scan immediately. Buffered transactions are still consumable via `next()`. |
+| `stats(): Promise<SyncStats>`                  | Returns scan statistics once the stream is exhausted.                                             |
 
-- [`docs/architecture.md`](docs/architecture.md) — workspace design
-- [`docs/key-derivation.md`](docs/key-derivation.md) — BIP-39 → UFVK pipeline
-- [`docs/block-sync.md`](docs/block-sync.md) — gRPC trial + full decryption
-- [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
-- [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
+## Types
 
-## Release
+### `SyncParams`
 
-Versioning is managed with [Changesets](https://github.com/changesets/action). Every merge to `main` triggers the CI workflow, which:
-
-1. Builds all artifacts in parallel on their respective platforms
-2. Either opens/updates a **"Version Packages"** PR if changesets are pending
-3. Or publishes immediately if the "Version Packages" PR has already been merged
-
-### Publishing a new version
-
-```bash
-# 1. Describe the change (patch / minor / major)
-pnpm changeset
-
-# 2. Commit the generated .changeset file and push
-git add .changeset/
-git commit -m "chore: add changeset"
-git push
-
-# 3. Merge the PR → CI automatically opens a "Version Packages" PR
-# 4. Merge the "Version Packages" PR → CI publishes
+```typescript
+interface SyncParams {
+  /** gRPC endpoint URL */
+  grpcUrl: string;
+  /** Unified Full Viewing Key (UFVK) for the account to scan */
+  viewingKey: string;
+  /** First block height to scan (inclusive) */
+  startHeight: number;
+  /** Last block height to scan (inclusive) */
+  endHeight: number;
+  /** "mainnet" or "testnet" (default: "testnet") */
+  network?: string;
+  /**
+   * When true, only Orchard actions are processed — eliminates all Sapling
+   * crypto work. Set to true for Ledger wallets (Orchard-only support).
+   */
+  orchardOnly?: boolean;
+  /**
+   * Maximum retry attempts per range on transient errors.
+   * The failing range is split in half on each retry. Defaults to 3.
+   */
+  maxRetries?: number;
+  /** Emit per-phase timing diagnostics to stderr every 10 seconds */
+  verbose?: boolean;
+}
 ```
 
-### Artifacts produced per release
+### `ShieldedTransaction`
 
-| Artifact                           | Distribution       | Platforms                   |
-| ---------------------------------- | ------------------ | --------------------------- |
-| `@ledgerhq/zcash-utils`            | Ledger JFrog (npm) | All (bundled `.node` files) |
-| `ledger-zcash-cli-macos-universal` | GitHub Release     | macOS arm64 + x64           |
-| `ledger-zcash-cli-linux-x86_64`    | GitHub Release     | Linux x64 (static musl)     |
+```typescript
+interface ShieldedTransaction {
+  txid: string; // Transaction ID (big-endian hex)
+  hex: string; // Raw transaction bytes (hex)
+  blockHeight: number;
+  blockHash: string; // Block hash (big-endian hex)
+  blockTime: number; // Unix timestamp (seconds)
+  fee: number; // Fee in zatoshis
+  saplingNotes: ShieldedNote[];
+  orchardNotes: ShieldedNote[];
+}
+```
 
-The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
+### `ShieldedNote`
 
-The npm package is published to the internal Ledger JFrog Artifactory registry. The CI authenticates via OIDC (`LedgerHQ/actions-security/actions/jfrog-login`) and configures `.npmrc` to route `@ledgerhq` scoped packages to the Artifactory URL.
+```typescript
+interface ShieldedNote {
+  amount: number; // Amount in zatoshis
+  transferType: string; // "incoming", "outgoing", or "internal"
+  memo: string;
+}
+```
 
-CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are not part of the npm package.
+### `SyncStats`
 
-### Required secrets and variables
-
-| Secret / Variable              | Purpose                                               |
-| ------------------------------ | ----------------------------------------------------- |
-| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions              |
-| `vars.ARTIFACTORY_PUBLISH_URL` | JFrog Artifactory registry URL (without `https://`)  |
+```typescript
+interface SyncStats {
+  blocksScanned: number;
+  elapsedMs: number;
+}
+```
 
 ## License
 
