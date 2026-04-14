@@ -9,6 +9,12 @@ license = "MIT OR Apache-2.0"
 name = "zcash_crypto"
 path = "src/lib.rs"
 
+[features]
+# Enables the transparent (P2PKH) key component in the UFVK produced by
+# `derive_keys`. Only needed by the CLI; the FFI node crate only does trial
+# decryption and does not need transparent key support.
+transparent-inputs = ["zcash_keys/transparent-inputs"]
+
 [dependencies]
 # zcash_client_backend: only the `orchard` feature is needed here.
 # The `lightwalletd-tonic` feature (gRPC client + proto types) is NOT included
