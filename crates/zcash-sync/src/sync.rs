@@ -140,6 +140,7 @@ pub struct SyncResult {
 /// - gRPC deadline / stream timeout
 /// - HTTP 503 from the load balancer (returned when the node is under heavy load,
 ///   manifests as a malformed gRPC frame because tonic receives an HTML error page)
+/// - HTTP/2 stream errors (connection reset, broken pipe, etc.)
 fn is_retryable_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
     s.contains("timeout")
@@ -148,6 +149,9 @@ fn is_retryable_error(e: &anyhow::Error) -> bool {
         || s.contains("503")
         || s.contains("service unavailable")
         || (s.contains("internal error") && s.contains("compression flag"))
+        || s.contains("h2 protocol error")
+        || s.contains("connection reset")
+        || s.contains("broken pipe")
 }
 
 /// Scan a range of compact blocks for shielded transactions belonging to the
