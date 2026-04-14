@@ -10,7 +10,7 @@ name = "ledger-zcash-cli"
 path = "src/main.rs"
 
 [dependencies]
-zcash-crypto = { path = "../zcash-crypto" }
+zcash-crypto = { path = "../zcash-crypto", features = ["transparent-inputs"] }
 zcash-sync   = { path = "../zcash-sync" }
 
 anyhow     = { workspace = true }
