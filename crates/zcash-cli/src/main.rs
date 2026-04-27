@@ -47,6 +47,11 @@ enum Commands {
     ///
     /// Requires a running lightwalletd / Zaino endpoint.
     Sync(SyncArgs),
+
+    /// Find the block height closest to a given date or Unix timestamp.
+    ///
+    /// Performs a binary search over block timestamps via gRPC.
+    HeightAt(HeightAtArgs),
 }
 
 // ─── derive subcommand ────────────────────────────────────────────────────────
@@ -87,6 +92,20 @@ struct TipArgs {
     /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
     #[arg(long)]
     grpc_url: String,
+}
+
+// ─── height-at subcommand ────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+struct HeightAtArgs {
+    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
+    #[arg(long)]
+    grpc_url: String,
+
+    /// Target date (YYYY-MM-DD) or Unix timestamp (integer).
+    /// Returns the first block at or after this time.
+    #[arg(long)]
+    date: String,
 }
 
 // ─── sync subcommand ──────────────────────────────────────────────────────────
@@ -155,6 +174,7 @@ async fn main() {
     match cli.command {
         Commands::Derive(args) => cmd_derive(args),
         Commands::Tip(args) => cmd_tip(args).await,
+        Commands::HeightAt(args) => cmd_height_at(args).await,
         Commands::Sync(args) => cmd_sync(args).await,
     }
 }
@@ -232,6 +252,62 @@ async fn cmd_tip(args: TipArgs) {
             std::process::exit(1);
         }
     }
+}
+
+async fn cmd_height_at(args: HeightAtArgs) {
+    let timestamp = parse_date_or_timestamp(&args.date);
+    match zcash_sync::client::find_block_height(args.grpc_url, timestamp).await {
+        Ok(height) => println!("{height}"),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse a date string (`YYYY-MM-DD`, midnight UTC) or a raw Unix timestamp.
+fn parse_date_or_timestamp(input: &str) -> u32 {
+    // Try as integer first.
+    if let Ok(ts) = input.parse::<u32>() {
+        return ts;
+    }
+
+    // Try as YYYY-MM-DD → midnight UTC.
+    let parts: Vec<&str> = input.split('-').collect();
+    if parts.len() == 3 {
+        if let (Ok(y), Ok(m), Ok(d)) = (
+            parts[0].parse::<i64>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+        ) {
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                // Days from Unix epoch (1970-01-01) to the target date.
+                // Uses the same calendar arithmetic as format_block_time in this file.
+                let days = days_since_epoch(y, m, d);
+                if days >= 0 {
+                    return (days as u64 * 86400) as u32;
+                }
+            }
+        }
+    }
+
+    eprintln!("Error: cannot parse '{input}' as YYYY-MM-DD or Unix timestamp");
+    std::process::exit(1);
+}
+
+/// Convert a calendar date to days since 1970-01-01 (civil calendar).
+fn days_since_epoch(year: i64, month: u32, day: u32) -> i64 {
+    // Adjust so March = month 1 (simplifies leap-year math).
+    let (y, m) = if month <= 2 {
+        (year - 1, month as i64 + 9)
+    } else {
+        (year, month as i64 - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * m + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 async fn cmd_sync(args: SyncArgs) {

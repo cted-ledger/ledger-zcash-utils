@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, ChainSpec,
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
 };
 
 /// Timeout for establishing the TCP+TLS connection.
@@ -42,14 +42,10 @@ pub async fn connect(grpc_url: &str) -> Result<Channel> {
     Ok(channel)
 }
 
-/// Query the current chain tip height from a lightwalletd endpoint.
-///
-/// # Errors
-///
-/// Returns an error if the connection fails or the RPC call is rejected.
-pub async fn chain_tip(grpc_url: String) -> Result<u32> {
-    let channel = connect(&grpc_url).await?;
-    let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
+/// Query the current chain tip height using an existing client.
+pub(crate) async fn chain_tip_with_client(
+    client: &mut CompactTxStreamerClient<Channel>,
+) -> Result<u32> {
     let mut req = tonic::Request::new(ChainSpec {});
     req.set_timeout(UNARY_TIMEOUT);
     let latest = client
@@ -58,6 +54,132 @@ pub async fn chain_tip(grpc_url: String) -> Result<u32> {
         .map_err(|e| anyhow!("GetLatestBlock failed: {}", e))?
         .into_inner();
     Ok(latest.height as u32)
+}
+
+/// Query the current chain tip height from a lightwalletd endpoint.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or the RPC call is rejected.
+pub async fn chain_tip(grpc_url: String) -> Result<u32> {
+    let channel = connect(&grpc_url).await?;
+    let mut client = CompactTxStreamerClient::new(channel);
+    chain_tip_with_client(&mut client).await
+}
+
+/// Fetch the timestamp of a single block by height (unary `GetBlock` RPC).
+async fn get_block_time(
+    client: &mut CompactTxStreamerClient<Channel>,
+    height: u32,
+) -> Result<u32> {
+    let mut req = tonic::Request::new(BlockId {
+        height: height as u64,
+        hash: vec![],
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+    let block = client
+        .get_block(req)
+        .await
+        .map_err(|e| anyhow!("GetBlock({}) failed: {}", height, e))?
+        .into_inner();
+    Ok(block.time)
+}
+
+/// When the search range is narrower than this, fetch all remaining blocks
+/// in a single `GetBlockRange` streaming RPC instead of continuing one-by-one.
+const RANGE_FETCH_THRESHOLD: u32 = 500;
+
+/// Find the height of the first block whose timestamp is ≥ `timestamp`.
+///
+/// Uses **interpolation search** (O(log log n) RPCs, ~3-4 iterations) to
+/// narrow the range, then a single `GetBlockRange` streaming RPC to find
+/// the exact block. Typically completes in ~6 RPCs total instead of ~23
+/// with a naive binary search.
+///
+/// Returns a height clamped to `[1, tip]`.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or any RPC call is rejected.
+pub async fn find_block_height(grpc_url: String, timestamp: u32) -> Result<u32> {
+    let channel = connect(&grpc_url).await?;
+    let mut client = CompactTxStreamerClient::new(channel);
+
+    let tip = chain_tip_with_client(&mut client).await?;
+    if tip == 0 {
+        return Ok(0);
+    }
+
+    let mut low: u32 = 1;
+    let mut high: u32 = tip;
+
+    // Fetch boundary timestamps (2 RPCs).
+    let mut low_t = get_block_time(&mut client, low).await?;
+    if timestamp <= low_t {
+        return Ok(low);
+    }
+    let mut high_t = get_block_time(&mut client, high).await?;
+    if timestamp >= high_t {
+        return Ok(high);
+    }
+
+    // Phase 1: interpolation search — narrow the range to ≤ RANGE_FETCH_THRESHOLD.
+    // Block timestamps are nearly linear (~75s/block), so interpolation
+    // converges in ~3-4 iterations for 3M+ blocks.
+    while high - low > RANGE_FETCH_THRESHOLD {
+        let range_h = (high - low) as u64;
+        let range_t = (high_t - low_t).max(1) as u64;
+        let offset_t = (timestamp - low_t) as u64;
+        let est = low + ((offset_t * range_h / range_t) as u32).clamp(1, (high - low) - 1);
+
+        let est_t = get_block_time(&mut client, est).await?;
+
+        if est_t < timestamp {
+            low = est;
+            low_t = est_t;
+        } else {
+            high = est;
+            high_t = est_t;
+        }
+    }
+
+    // Phase 2: stream remaining blocks in one GetBlockRange RPC.
+    find_in_range(&mut client, low, high, timestamp).await
+}
+
+/// Fetch all blocks in `[low, high]` via a single streaming RPC and return
+/// the height of the first block whose timestamp is ≥ `timestamp`.
+/// Falls back to `high` if no block in the range meets the condition.
+async fn find_in_range(
+    client: &mut CompactTxStreamerClient<Channel>,
+    low: u32,
+    high: u32,
+    timestamp: u32,
+) -> Result<u32> {
+    let range = BlockRange {
+        start: Some(BlockId { height: low as u64, hash: vec![] }),
+        end: Some(BlockId { height: high as u64, hash: vec![] }),
+    };
+
+    let mut stream = client
+        .get_block_range(range)
+        .await
+        .map_err(|e| anyhow!("GetBlockRange({}-{}) failed: {}", low, high, e))?
+        .into_inner();
+
+    let mut candidate = high;
+    while let Some(block) = stream
+        .message()
+        .await
+        .map_err(|e| anyhow!("GetBlockRange stream error: {}", e))?
+    {
+        if block.time >= timestamp {
+            candidate = block.height as u32;
+            break;
+        }
+    }
+
+    Ok(candidate)
 }
 
 #[cfg(test)]
@@ -122,6 +244,35 @@ mod tests {
         tokio::task::yield_now().await;
 
         let err = connect_fut.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_block_height_fails_on_malformed_url() {
+        let err = find_block_height("not a url".to_string(), 1_700_000_000)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid gRPC URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_block_height_fails_on_refused_port() {
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let err =
+            find_block_height(format!("https://127.0.0.1:{}", addr.port()), 1_700_000_000)
+                .await
+                .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "unexpected error: {err}"
