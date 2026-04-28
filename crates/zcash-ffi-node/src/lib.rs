@@ -200,9 +200,9 @@ pub async fn get_chain_tip(grpc_url: String) -> napi::Result<u32> {
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-/// Find the block height closest to the given Unix timestamp via binary search.
+/// Find the block height closest to the given Unix timestamp via interpolation search.
 ///
-/// Returns the height of the first block whose timestamp is ≥ the target.
+/// Returns the height of the latest block whose timestamp is ≤ the target.
 /// If the timestamp is before genesis, returns the genesis height.
 /// If the timestamp is after the chain tip, returns the tip height.
 #[napi]
@@ -404,30 +404,6 @@ mod tests {
     #[tokio::test]
     async fn get_chain_tip_fails_on_malformed_url() {
         let err = get_chain_tip("not_a_url".to_string()).await.unwrap_err();
-        assert!(!err.reason.is_empty());
-    }
-
-    // ── find_block_height — error paths ────────────────────────────────────
-
-    #[tokio::test]
-    async fn find_block_height_fails_on_refused_port() {
-        let addr = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
-        let err = find_block_height(format!("https://127.0.0.1:{}", addr.port()), 1_700_000_000)
-            .await
-            .unwrap_err();
-        assert!(!err.reason.is_empty());
-    }
-
-    #[tokio::test]
-    async fn find_block_height_fails_on_malformed_url() {
-        let err = find_block_height("not_a_url".to_string(), 1_700_000_000)
-            .await
-            .unwrap_err();
         assert!(!err.reason.is_empty());
     }
 

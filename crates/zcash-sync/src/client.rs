@@ -89,7 +89,7 @@ async fn get_block_time(
 /// in a single `GetBlockRange` streaming RPC instead of continuing one-by-one.
 const RANGE_FETCH_THRESHOLD: u32 = 500;
 
-/// Find the height of the first block whose timestamp is ≥ `timestamp`.
+/// Find the height of the latest block whose timestamp is ≤ `timestamp`.
 ///
 /// Uses **interpolation search** (O(log log n) RPCs, ~3-4 iterations) to
 /// narrow the range, then a single `GetBlockRange` streaming RPC to find
@@ -148,8 +148,8 @@ pub async fn find_block_height(grpc_url: String, timestamp: u32) -> Result<u32> 
 }
 
 /// Fetch all blocks in `[low, high]` via a single streaming RPC and return
-/// the height of the first block whose timestamp is ≥ `timestamp`.
-/// Falls back to `high` if no block in the range meets the condition.
+/// the height of the latest block whose timestamp is ≤ `timestamp`.
+/// Falls back to `low` if no block in the range meets the condition.
 async fn find_in_range(
     client: &mut CompactTxStreamerClient<Channel>,
     low: u32,
@@ -167,14 +167,15 @@ async fn find_in_range(
         .map_err(|e| anyhow!("GetBlockRange({}-{}) failed: {}", low, high, e))?
         .into_inner();
 
-    let mut candidate = high;
+    let mut candidate = low;
     while let Some(block) = stream
         .message()
         .await
         .map_err(|e| anyhow!("GetBlockRange stream error: {}", e))?
     {
-        if block.time >= timestamp {
+        if block.time <= timestamp {
             candidate = block.height as u32;
+        } else {
             break;
         }
     }
@@ -277,5 +278,68 @@ mod tests {
             err.to_string().contains("gRPC connect failed"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── algorithm mock tests ─────────────────────────────────────────────────
+    //
+    // The gRPC server trait is not exposed by zcash_client_backend, so we
+    // mirror the interpolation + scan algorithm against a synthetic chain.
+    // This acts as an executable spec: if the production logic changes, the
+    // mirror must be updated too — any divergence is a review signal.
+
+    fn mock_find_block_height(chain: &[(u32, u32)], timestamp: u32) -> u32 {
+        let tip = chain.last().unwrap().0;
+        if tip == 0 { return 0; }
+
+        let get_time = |h: u32| -> u32 {
+            chain.iter().find(|(height, _)| *height == h).unwrap().1
+        };
+
+        let (mut low, mut high) = (chain[0].0, tip);
+        let (mut low_t, mut high_t) = (get_time(low), get_time(high));
+        if timestamp <= low_t { return low; }
+        if timestamp >= high_t { return high; }
+
+        while high - low > RANGE_FETCH_THRESHOLD {
+            let range_h = (high - low) as u64;
+            let range_t = (high_t - low_t).max(1) as u64;
+            let offset_t = (timestamp - low_t) as u64;
+            let est = low + ((offset_t * range_h / range_t) as u32).clamp(1, (high - low) - 1);
+            let est_t = get_time(est);
+            if est_t < timestamp { low = est; low_t = est_t; }
+            else { high = est; high_t = est_t; }
+        }
+
+        let mut candidate = low;
+        for &(h, t) in chain {
+            if h < low || h > high { continue; }
+            if t <= timestamp { candidate = h; } else { break; }
+        }
+        candidate
+    }
+
+    fn make_chain(count: u32, genesis_ts: u32, interval: u32) -> Vec<(u32, u32)> {
+        (1..=count).map(|h| (h, genesis_ts + h * interval)).collect()
+    }
+
+    #[test]
+    fn mock_algo_returns_block_before_when_between_timestamps() {
+        let chain = make_chain(10_000, 1_000_000, 75);
+        let t_5000 = chain.iter().find(|(h, _)| *h == 5000).unwrap().1;
+        let t_5001 = chain.iter().find(|(h, _)| *h == 5001).unwrap().1;
+        let result = mock_find_block_height(&chain, (t_5000 + t_5001) / 2);
+        assert_eq!(result, 5000, "should return latest block ≤ target");
+    }
+
+    #[test]
+    fn mock_algo_matches_brute_force_across_range() {
+        let chain = make_chain(5_000, 1_477_000_000, 75);
+        let brute = |ts: u32| -> u32 {
+            chain.iter().rev().find(|(_, t)| *t <= ts).map(|(h, _)| *h).unwrap_or(chain[0].0)
+        };
+        for &target in &[1_477_100_000u32, 1_477_200_000, 1_477_300_000, 1_477_375_000] {
+            let result = mock_find_block_height(&chain, target);
+            assert_eq!(result, brute(target), "mismatch for timestamp {target}");
+        }
     }
 }
